@@ -47,3 +47,8 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# R Targets folder
+_targets/*
+!_tartgets/meta/
+_targets/.gitignore
