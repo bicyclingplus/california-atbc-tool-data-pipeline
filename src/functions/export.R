@@ -94,112 +94,90 @@ prepare_and_export_web_blocks <- function(data, output_path) {
 }
 
 # Appendix A
-generate_localized_appendix_a <- function(links, nodes, processed_crash_proj, 
-                                          output_path_links = "data_processed/appendix_a_links.csv",
-                                          output_path_nodes = "data_processed/appendix_a_nodes.csv") {
+# Calculate Systemic Risk (Normalized per year and per mile/intersection)
+calculate_systemic_risk <- function(network_sf, models_list, years_of_data = 5) {
   require(dplyr)
   require(sf)
-  require(readr)
-  require(tidyr)
+  require(MASS)
   
-  p <- 0.4 # Power parameter from Elvik and Goel (2019)
+  mod_hurdle <- models_list$model_hurdle
+  mod_count  <- models_list$model_count
+  mod_sev    <- models_list$model_severity
+  mode_name  <- models_list$mode
+  is_node    <- models_list$is_node
   
-  # --- Determine the year span for normalization ---
-  year_span <- length(unique(processed_crash_proj$ACCIDENT_YEAR))
-  if (year_span == 0) year_span <- 5 # Fallback if missing
+  message(paste("Scoring Epidemiological Rates for:", mode_name, ifelse(is_node, "(Nodes)", "(Links)")))
   
-  # --- PREVENT DUPLICATES: Strict 1-to-1 Snapping ---
-  crashes_int <- processed_crash_proj %>% filter(INTERSECTION == "Y")
-  crashes_seg <- processed_crash_proj %>% filter(INTERSECTION != "Y" | is.na(INTERSECTION))
+  # 1. Prepare Network
+  vol_col <- ifelse(mode_name == "Bike", "pred_bike_vol", "pred_ped_vol")
   
-  node_idx <- st_nearest_feature(crashes_int, nodes)
-  crashes_int$node_id <- nodes$node_id[node_idx]
+  df_pred <- network_sf %>%
+    mutate(
+      vol_safe = ifelse(.data[[vol_col]] <= 0, 0.1, as.numeric(.data[[vol_col]])),
+      # Calculate length in miles (nodes are treated as 1 unit)
+      len_miles = if (is_node) 1 else (as.numeric(length_ft) / 5280),
+      len_miles = ifelse(len_miles <= 0, 0.001, len_miles)
+    )
   
-  link_idx <- st_nearest_feature(crashes_seg, links)
-  crashes_seg$edge_uid <- links$edge_uid[link_idx]
+  # 2. Predict Raw Frequency (Total Expected Crashes over 5 years on this exact geometry)
+  p_crash <- predict(mod_hurdle, newdata = df_pred, type = "response")
+  exp_count_given_crash <- predict(mod_count, newdata = df_pred, type = "response")
   
-  # --- AGGREGATION ---
-  calculate_alphas <- function(network_df, crash_df, mode_label, loc_type, is_node) {
-    
-    # Safely define dynamic column names upfront
-    is_bike <- mode_label == "Bike"
-    exp_col <- if (is_bike) "bicycle_exposure_class" else "pedestrian_exposure_class"
-    vol_col <- if (is_bike) "pred_bike_vol" else "pred_ped_vol"
-    join_col <- if (is_node) "node_id" else "edge_uid"
-    
-    mode_crashes <- crash_df %>% 
-      filter(if (is_bike) BICYCLE_ACCIDENT == "Y" else PEDESTRIAN_ACCIDENT == "Y")
-    
-    crash_summary <- mode_crashes %>%
-      st_drop_geometry() %>%
-      group_by(!!sym(join_col)) %>%
-      summarise(
-        total_crashes = n(),
-        total_injuries = sum(NUMBER_INJURED, na.rm = TRUE),
-        total_deaths = sum(NUMBER_KILLED, na.rm = TRUE),
-        .groups = "drop"
+  df_pred$raw_expected_crashes <- p_crash * exp_count_given_crash
+  
+  # 3. Predict Severity Probabilities
+  sev_probs <- predict(mod_sev, newdata = df_pred, type = "probs")
+  
+  prob_minor  <- sev_probs[, "Minor"]
+  prob_severe <- sev_probs[, "Severe"]
+  prob_fatal  <- sev_probs[, "Fatal"]
+  
+  # Injuries = Minor + Severe
+  df_pred$prob_injury <- prob_minor + prob_severe
+  df_pred$prob_fatal  <- prob_fatal
+  
+  # 4. Calculate Base Normalized Rates
+  df_rates <- df_pred %>%
+    mutate(
+      mode = mode_name,
+      location_type = ifelse(is_node, "Intersection", "Roadway"),
+      
+      # Step A: Normalize to Annual Base
+      annual_crashes = raw_expected_crashes / years_of_data,
+      
+      # Step B: Normalize to Spatial Unit 
+      base_rate_crashes = annual_crashes / len_miles,
+      
+      # Step C: Apply Severity Probabilities
+      base_rate_injuries   = base_rate_crashes * prob_injury,
+      base_rate_fatalities = base_rate_crashes * prob_fatal
+    ) %>%
+    st_drop_geometry()
+  
+  # 5. Apply Explicit Column Names Based on Location Type
+  if (is_node) {
+    df_final <- df_rates %>%
+      dplyr::select(
+        edge_uid = dplyr::any_of(c("edge_uid", "node_id")), 
+        mode,
+        location_type,
+        functional,
+        crashes_per_intersection_year = base_rate_crashes,
+        injuries_per_intersection_year = base_rate_injuries,
+        fatalities_per_intersection_year = base_rate_fatalities
       )
-    
-    network_df %>%
-      st_drop_geometry() %>%
-      left_join(crash_summary, by = join_col) %>%
-      mutate(across(starts_with("total_"), ~replace_na(.x, 0))) %>%
-      # Safely inject the defined column names
-      group_by(
-        exposure_class = .data[[exp_col]], 
-        functional
-      ) %>%
-      summarise(
-        prevalence = if(is_node) n() else sum(length_ft / 5280, na.rm = TRUE),
-        avg_vol = mean(.data[[vol_col]], na.rm = TRUE),
-        crashes_py = sum(total_crashes) / year_span,
-        injuries_py = sum(total_injuries) / year_span,
-        deaths_py = sum(total_deaths) / year_span,
-        .groups = "drop"
-      ) %>%
-      mutate(
-        location = loc_type,
-        mode = mode_label,
-        rate_c = crashes_py / prevalence,
-        rate_i = injuries_py / prevalence,
-        rate_d = deaths_py / prevalence,
-        alpha_crash = log(rate_c / (avg_vol^p)),
-        alpha_injury = log(rate_i / (avg_vol^p)),
-        alpha_death = log(rate_d / (avg_vol^p))
-      ) %>%
-      mutate(across(starts_with("alpha_"), ~ifelse(is.infinite(.), -15, .)))
+  } else {
+    df_final <- df_rates %>%
+      dplyr::select(
+        edge_uid = dplyr::any_of(c("edge_uid", "node_id")), 
+        mode,
+        location_type,
+        functional,
+        crashes_per_mile_year = base_rate_crashes,
+        injuries_per_mile_year = base_rate_injuries,
+        fatalities_per_mile_year = base_rate_fatalities
+      )
   }
   
-  # --- COMPILE FINAL TABLES ---
-  appendix_a_links <- bind_rows(
-    calculate_alphas(links, crashes_seg, "Bike", "Roadway", FALSE),
-    calculate_alphas(links, crashes_seg, "Walk", "Roadway", FALSE)
-  ) %>%
-    select(
-      `Location` = location, `Mode` = mode, `Exposure Class` = exposure_class,
-      `Functional Class` = functional, `Prevalence (miles)` = prevalence,
-      `Average Daily Volume (bike/ped)` = avg_vol, `Crashes/mile/year` = rate_c,
-      `Injuries/mile/year` = rate_i, `Deaths/mile/year` = rate_d,
-      `α Crash` = alpha_crash, `α Injury` = alpha_injury, `α Death` = alpha_death
-    )
-  
-  appendix_a_nodes <- bind_rows(
-    calculate_alphas(nodes, crashes_int, "Bike", "Intersection", TRUE),
-    calculate_alphas(nodes, crashes_int, "Walk", "Intersection", TRUE)
-  ) %>%
-    select(
-      `Location` = location, `Mode` = mode, `Exposure Class` = exposure_class,
-      `Functional Class` = functional, `Prevalence (count)` = prevalence,
-      `Average Daily Volume (bike/ped)` = avg_vol, `Crashes/intersection/year` = rate_c,
-      `Injuries/intersection/year` = rate_i, `Deaths/intersection/year` = rate_d,
-      `α Crash` = alpha_crash, `α Injury` = alpha_injury, `α Death` = alpha_death
-    )
-  
-  # Added back the directory check!
-  if(!dir.exists(dirname(output_path_links))) dir.create(dirname(output_path_links), recursive = TRUE)
-  
-  write_csv(appendix_a_links, output_path_links)
-  write_csv(appendix_a_nodes, output_path_nodes)
-  
-  return(c(output_path_links, output_path_nodes))
+  return(df_final)
 }

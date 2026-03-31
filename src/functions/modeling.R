@@ -64,7 +64,7 @@ train_model <- function(train_data, mode = "bike", model_type = "ranger") {
     "retail_low", "retail_high", "supermarket_low", "supermarket_high",
     "parks_low", "parks_high", "trails_low", "trails_high",
     "community_low", "community_high", "transit_low", "transit_high",
-    "infra_type", "is_paved", "speed_limit", "crash_count_30m", "precip_annual"
+    "infra_type", "is_paved", "speed_limit", "precip_annual"
   )
   
   if(mode == "ped"){
@@ -238,7 +238,7 @@ predict_split_networks <- function(bike_model, ped_model, link_net, node_net) {
 
 # --- Fit a Hierarchical Poisson GLM for on-the-fly webtool predictions ---
 #' @param data The training data (sf or dataframe)
-#' @param formula_obj The model formula (e.g., crash_count ~ flow + width)
+#' @param formula_obj The model formula 
 train_hglm <- function(train_data, mode_arg = "bike", 
                        target_col = "aadt", id_col = "spatial_id") {
   
@@ -396,4 +396,40 @@ validate_hglm_kfold <- function(data, mode_arg = "bike",
   return(summary_stats)
 }
 
- 
+# --- Fit Safety Models ---
+#' Fit Frequency (Hurdle) and Severity (Ordinal) Safety Models
+#' Fit Frequency and Severity Safety Models (Stripped Down)
+fit_safety_models <- function(prepped_data) {
+  require(dplyr)
+  require(MASS) 
+  
+  freq_data <- prepped_data$freq_data
+  sev_data  <- prepped_data$sev_data
+  
+  # 1. Define Base Formula
+  if (prepped_data$is_node) {
+    base_form <- " ~ log(vol_safe) + functional"
+  } else {
+    base_form <- " ~ log(vol_safe) + functional + log(len_miles)"
+  }
+  
+  # 2. Fit Hurdle Model (Logistic: Does a crash happen at all? 0 vs 1+)
+  form_hurdle <- as.formula(paste0("has_crash", base_form))
+  mod_hurdle <- glm(form_hurdle, data = freq_data, family = binomial(link = "logit"))
+  
+  # 3. Fit Count Model (Poisson: How many crashes, given at least 1 happened?)
+  form_count <- as.formula(paste0("crash_count", base_form))
+  mod_count <- glm(form_count, data = filter(freq_data, has_crash == 1), family = poisson(link = "log"))
+  
+  # 4. Fit Severity Model (Ordinal: Given a crash, how bad is it?)
+  form_sev <- as.formula(paste0("severity_ord", base_form))
+  mod_sev <- polr(form_sev, data = sev_data, Hess = TRUE)
+  
+  return(list(
+    mode = prepped_data$mode,
+    is_node = prepped_data$is_node,
+    model_hurdle = mod_hurdle,
+    model_count = mod_count,
+    model_severity = mod_sev
+  ))
+}

@@ -3,6 +3,18 @@ library(tarchetypes)
 library(furrr)
 library(crew)
 
+# Function to read and write data to directory of store (Box, etc.)
+data_io <- function(sub_path) {
+  # 1. Get the store path (e.g., "C:/Users/You/Box/Project/_targets")
+  store_path <- targets::tar_config_get("store")
+  
+  # 2. Go up one level to get the Project Root on Box
+  box_root <- dirname(store_path)
+  
+  # 3. Join with your requested file sub-path
+  file.path(box_root, sub_path)
+}
+
 # Source all functions (including src/functions/expansions.R)
 tar_source("src/functions")
 
@@ -35,7 +47,7 @@ list(
   # ============================================================================
   tar_target(
     strava_zip_files, 
-    list.files("data_raw/strava_caltrans_district_2023", 
+    list.files(data_io("data_raw/strava_caltrans_district_2023"), 
                pattern = "all_edges_yearly_.*\\.zip$", 
                full.names = TRUE)
   ),
@@ -53,8 +65,8 @@ list(
   # SECTION 2: CONTEXT LAYERS (SLD, WI, Crash, Weather)
   # ============================================================================
   
-  tar_target(sld_shp_file, "data_raw/SLD/SmartLocationDb.shp", format = "file"),
-  tar_target(wi_shp_file, "data_raw/SLD/Natl_WI.shp", format = "file"),
+  tar_target(sld_shp_file, data_io("data_raw/SLD/SmartLocationDb.shp"), format = "file"),
+  tar_target(wi_shp_file, data_io("data_raw/SLD/Natl_WI.shp"), format = "file"),
   
   tar_target(
     sld_data,
@@ -83,25 +95,33 @@ list(
     get_spatial_weather(ca_stations, 2023)
   ),
   
-  tar_target(switrs_file, "data_raw/switrs_2019_2023/CRASH_PED_BIKE_2019-2023_20240912.csv", format = "file"),
-  tar_target(processed_crash, process_switrs_data(switrs_file)),
+  # SWITRS Relational Tables
+  tar_target(switrs_col_file, data_io("data_raw/switrs_2019_2023/CRASH_PED_BIKE_2019-2023_20240912.csv"), format = "file"),
+  tar_target(switrs_party_file, data_io("data_raw/switrs_2019_2023/PARTY_PED_BIKE_2019-2023_20240912.csv"), format = "file"),
+  tar_target(switrs_victim_file, data_io("data_raw/switrs_2019_2023/VICTIM_PED_BIKE_2019-2023_20240912.csv"), format = "file"),
+  
+  # Process and project crashes immediately
+  tar_target(
+    processed_crash_proj, 
+    prep_switrs_crashes(switrs_col_file, switrs_party_file, switrs_victim_file)
+  ),
   
   tar_target(
     census_blocks,
-    st_read("data_raw/census/blocks_optimized.gpkg", quiet = TRUE) %>% 
+    st_read(data_io("data_raw/census/blocks_optimized.gpkg"), quiet = TRUE) %>% 
       st_transform(3310)
   ),
   # ============================================================================
   # SECTION 3: COUNT DATA (Ground Truth)
   # ============================================================================
-  tar_target(ucb_bike_file, "data_raw/ucb_bike_AADB/Model_clean_data_july23_AADBT.csv", format = "file"),
-  tar_target(ucb_ped_file, "data_raw/ucb_ped_AADP/PSIP_allvars_20200503_wSHS_newFC.csv", format = "file"),
+  tar_target(ucb_bike_file, data_io("data_raw/ucb_bike_AADB/Model_clean_data_july23_AADBT.csv"), format = "file"),
+  tar_target(ucb_ped_file, data_io("data_raw/ucb_ped_AADP/PSIP_allvars_20200503_wSHS_newFC.csv"), format = "file"),
   
   tar_target(ucb_bike_clean, load_ucb_bike(ucb_bike_file)),
   tar_target(ucb_ped_clean, load_ucb_ped(ucb_ped_file)),
   
-  tar_target(caltrans_bike_files, list.files("data_raw/atd", pattern = "caltrans_bicycle.*\\.csv", full.names = TRUE)),
-  tar_target(caltrans_ped_files, list.files("data_raw/atd", pattern = "caltrans_pedestrian.*\\.csv", full.names = TRUE)),
+  tar_target(caltrans_bike_files, list.files(data_io("data_raw/atd"), pattern = "caltrans_bicycle.*\\.csv", full.names = TRUE)),
+  tar_target(caltrans_ped_files, list.files(data_io("data_raw/atd"), pattern = "caltrans_pedestrian.*\\.csv", full.names = TRUE)),
   
   tar_target(caltrans_bike_clean, process_caltrans_counts(caltrans_bike_files, mode = "bike")),
   tar_target(caltrans_ped_clean, process_caltrans_counts(caltrans_ped_files, mode = "ped")),
@@ -130,25 +150,15 @@ list(
     iteration = "list"
   ),
   
-  # 3. Crashes (The fast, separate step)
-  tar_target(processed_crash_proj, st_transform(processed_crash, 3310)),
-  
+  # 3. Census joins
   tar_target(
-    strava_with_crashes,
-    enrich_crashes(strava_base, processed_crash_proj),
+    strava_with_census,
+    enrich_census(strava_base, census_blocks),
     pattern = map(strava_base),
     iteration = "list"
   ),
   
-  # 4. Census joins
-  tar_target(
-    strava_with_census,
-    enrich_census(strava_with_crashes, census_blocks),
-    pattern = map(strava_with_crashes),
-    iteration = "list"
-  ),
-  
-  # 5. Final Math
+  # 4. Final Math
   tar_target(
     enriched_strava_chunks,
     calculate_model_features(strava_with_census),
@@ -280,8 +290,7 @@ list(
     enrich_census_chunk(
       census_chunk = census_chunks,
       sld_sf       = sld_data,         
-      wi_sf        = wi_data,          
-      crash_sf     = processed_crash,  
+      wi_sf        = wi_data,        
       weather_sf   = weather_data      
     ),
     pattern = map(census_chunks),
@@ -344,33 +353,10 @@ list(
   ),
   
   # ============================================================================
-  # SECTION 8: WEBTOOL OUTPUTS
+  # SECTION 8: NETWORK FINALIZATION
   # ============================================================================
   
-  # 8.1 Extract Marginalized Equations (Fixed Effects Only)
-  tar_target(
-    web_model_assets_file,
-    export_web_model_assets(
-      hglm_ped = hglm_model_ped, 
-      hglm_bike = hglm_model_bike, 
-      output_path = "data_processed/model_coefficients.csv"
-    ),
-    format = "file"
-  ),
-  
-  # 8.2 Prepare Web Context Blocks 
-  # We only keep the geographic predictors. 
-  # Note: Year and Network vars are handled by the web UI, not the spatial join.
-  tar_target(
-    web_blocks_export_file,
-    prepare_and_export_web_blocks(
-      data = web_blocks_raw_chunks,
-      output_path = "data_processed/context_blocks.geojson"
-    ),
-    format = "file"
-  ),
-  
-  # 8.3 Map Volumes Across Network
+  # 8.1 Map Volumes Across Network
   # Cross-pollinates bike volumes to nodes, and ped volumes to links using your network_utils function
   tar_target(
     web_ready_network,
@@ -380,7 +366,7 @@ list(
     )
   ),
   
-  # 8.4 Finalize Web Network Attributes
+  # 8.2 Finalize Web Network Attributes
   # Calculates exposure classes, maps functional classifications, calculates lengths, and renames fields
   tar_target(
     final_web_network,
@@ -390,25 +376,74 @@ list(
     )
   ),
   
-  # 8.5 Generate Localized Safety Appendix A (CSVs)
-  # Uses the finalized assets so that `exposure_class` and `functional` are present for the aggregation
+  # ============================================================================
+  # SECTION 9: SYSTEMIC SAFETY MODELS (Epidemiological Framework)
+  # ============================================================================
+  
+  # Step A1: GIS Phase - Snap Crashes to Network STRICTLY 1-to-1
+  tar_target(prepped_bike_nodes, snap_crashes_to_network(final_web_network$nodes, processed_crash_proj, "Bike", is_node = TRUE)),
+  tar_target(prepped_bike_links, snap_crashes_to_network(final_web_network$links, processed_crash_proj, "Bike", is_node = FALSE)),
+  tar_target(prepped_ped_nodes,  snap_crashes_to_network(final_web_network$nodes, processed_crash_proj, "Walk", is_node = TRUE)),
+  tar_target(prepped_ped_links,  snap_crashes_to_network(final_web_network$links, processed_crash_proj, "Walk", is_node = FALSE)),
+  
+  # Step A2: Math Phase - Train the 4 distinct Models
+  tar_target(bike_node_models, fit_safety_models(prepped_bike_nodes)),
+  tar_target(bike_link_models, fit_safety_models(prepped_bike_links)),
+  tar_target(ped_node_models,  fit_safety_models(prepped_ped_nodes)),
+  tar_target(ped_link_models,  fit_safety_models(prepped_ped_links)),
+  
+  # Step B: Score the network (Calculate Epidemiological Rates of crash, injury, and death risk)
+  tar_target(systemic_risk_bike_nodes, calculate_systemic_risk(final_web_network$nodes, bike_node_models)),
+  tar_target(systemic_risk_bike_links, calculate_systemic_risk(final_web_network$links, bike_link_models)),
+  tar_target(systemic_risk_ped_nodes,  calculate_systemic_risk(final_web_network$nodes, ped_node_models)),
+  tar_target(systemic_risk_ped_links,  calculate_systemic_risk(final_web_network$links, ped_link_models)),
+  
+  # ============================================================================
+  # SECTION 10: WEBTOOL OUTPUT EXPORTS
+  # ============================================================================
+  
+  # 10.1 Extract Marginalized Equations (Fixed Effects Only)
   tar_target(
-    appendix_a_csvs,
-    generate_localized_appendix_a(
-      links = final_web_network$links, 
-      nodes = final_web_network$nodes, 
-      processed_crash_proj = processed_crash_proj,
-      output_path_links = "data_processed/appendix_a_links.csv",
-      output_path_nodes = "data_processed/appendix_a_nodes.csv"
+    web_model_assets_file,
+    export_web_model_assets(
+      hglm_ped = hglm_model_ped, 
+      hglm_bike = hglm_model_bike, 
+      output_path = data_io("data_processed/model_coefficients.csv")
     ),
     format = "file"
   ),
   
-  # 8.6 Export Final Network Layers (GeoJSON)
+  # 10.2 Prepare Web Context Blocks 
+  tar_target(
+    web_blocks_export_file,
+    prepare_and_export_web_blocks(
+      data = web_blocks_raw_chunks,
+      output_path = data_io("data_processed/context_blocks.geojson")
+    ),
+    format = "file"
+  ),
+  
+  # 10.3 Export Epidemiological Safety Models (CSVs)
+  # Notice: we now wrap the export paths in data_io() to match your Box directory setup
+  tar_target(
+    export_systemic_risk_csvs,
+    {
+      path_links <- data_io("data_processed/systemic_risk_links.csv")
+      path_nodes <- data_io("data_processed/systemic_risk_nodes.csv")
+      
+      write_csv(bind_rows(systemic_risk_bike_links, systemic_risk_ped_links), path_links)
+      write_csv(bind_rows(systemic_risk_bike_nodes, systemic_risk_ped_nodes), path_nodes)
+      
+      c(path_links, path_nodes)
+    },
+    format = "file"
+  ),
+  
+  # 10.4 Export Final Network Layers (GeoJSON) - Links
   tar_target(
     export_links_geojson,
     {
-      path <- "data_processed/links.geojson"
+      path <- data_io("data_processed/links.geojson")
       st_write(
         final_web_network$links, 
         path, 
@@ -421,11 +456,11 @@ list(
     format = "file"
   ),
   
-  # Save Intersections (Nodes) to geojson
+  # 10.5 Export Final Network Layers (GeoJSON) - Nodes
   tar_target(
     export_nodes_geojson,
     {
-      path <- "data_processed/nodes.geojson"
+      path <- data_io("data_processed/nodes.geojson")
       st_write(
         final_web_network$nodes, 
         path, 

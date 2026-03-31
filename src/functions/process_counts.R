@@ -120,3 +120,4 @@ process_caltrans_counts <- function(file_list, mode) {
   
   return(final_aadt)
 }
+

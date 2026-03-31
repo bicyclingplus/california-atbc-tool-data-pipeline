@@ -4,11 +4,162 @@ library(httr)
 library(jsonlite)
 
 #' Process SWITRS Crash Data
-process_switrs_data <- function(file_path) {
-  read_csv(file_path, show_col_types = FALSE) %>%
+#' Process and Relational Join SWITRS Crash Data
+prep_switrs_crashes <- function(collisions_file, parties_file, victims_file) {
+  require(dplyr)
+  require(sf)
+  require(readr)
+  
+  # 1. Read and spatially project the main collisions table
+  collisions <- read_csv(collisions_file, show_col_types = FALSE) %>%
     filter(!is.na(POINT_X), !is.na(POINT_Y)) %>%
     st_as_sf(coords = c("POINT_X", "POINT_Y"), crs = 4326) %>%
-    st_transform(3310) 
+    st_transform(3310) # California Albers
+  
+  # 2. Read the relational tables
+  parties <- read_csv(parties_file, show_col_types = FALSE)
+  victims <- read_csv(victims_file, show_col_types = FALSE)
+  
+  # 3. Map Victim Severities directly to an Ordered Factor
+  victims_mapped <- victims %>%
+    mutate(
+      VICTIM_DEGREE_OF_INJURY = as.character(VICTIM_DEGREE_OF_INJURY),
+      injury_label = case_when(
+        VICTIM_DEGREE_OF_INJURY == "1" ~ "Fatal",
+        VICTIM_DEGREE_OF_INJURY %in% c("2", "5") ~ "Severe",
+        VICTIM_DEGREE_OF_INJURY %in% c("3", "4", "6", "7") ~ "Minor",
+        TRUE ~ "PDO"
+      ),
+      severity_ord = factor(
+        injury_label, 
+        levels = c("PDO", "Minor", "Severe", "Fatal"), 
+        ordered = TRUE
+      )
+    )
+  
+  # 4. Join Victims to Parties and Aggregate to the Crash Level
+  crash_level_summary <- parties %>%
+    left_join(victims_mapped, by = c("CASE_ID", "PARTY_NUMBER")) %>%
+    group_by(CASE_ID) %>%
+    summarise(
+      crash_severity_ord = suppressWarnings(max(severity_ord, na.rm = TRUE)),
+      party_has_bike = any(PARTY_TYPE == "4", na.rm = TRUE) | any(VICTIM_ROLE == "4", na.rm = TRUE),
+      party_has_ped = any(PARTY_TYPE == "2", na.rm = TRUE) | any(VICTIM_ROLE == "3", na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      crash_severity_ord = if_else(
+        is.na(crash_severity_ord), 
+        factor("PDO", levels = levels(victims_mapped$severity_ord), ordered = TRUE), 
+        crash_severity_ord
+      )
+    )
+  
+  # 5. Join back to Collisions spatial object
+  processed_crashes <- collisions %>%
+    left_join(crash_level_summary, by = "CASE_ID") %>%
+    mutate(
+      severity_ord = coalesce(crash_severity_ord, factor("PDO", levels = c("PDO", "Minor", "Severe", "Fatal"), ordered = TRUE)),
+      BICYCLE_ACCIDENT = ifelse(BICYCLE_ACCIDENT == "Y" | coalesce(party_has_bike, FALSE), "Y", "N"),
+      PEDESTRIAN_ACCIDENT = ifelse(PEDESTRIAN_ACCIDENT == "Y" | coalesce(party_has_ped, FALSE), "Y", "N")
+    ) %>%
+    select(-crash_severity_ord, -party_has_bike, -party_has_ped)
+  
+  return(processed_crashes)
+}
+
+#' Snap Crashes to Network STRICTLY 1-to-1 (No Duplicates)
+snap_crashes_to_network <- function(network_sf, crashes_sf, mode_name, is_node) {
+  require(dplyr)
+  require(sf)
+  require(tidyr)
+  
+  message(paste("GIS Phase: Strict 1-to-1 Snapping of", mode_name, "crashes to", ifelse(is_node, "Nodes", "Links")))
+  
+  # 1. Filter Crashes by Mode
+  if (mode_name == "Bike") {
+    target_crashes <- crashes_sf %>% filter(BICYCLE_ACCIDENT == "Y")
+  } else {
+    target_crashes <- crashes_sf %>% filter(PEDESTRIAN_ACCIDENT == "Y")
+  }
+  
+  # 2. Bounding Box Pre-filter (Efficiency Win)
+  net_bbox <- st_as_sfc(st_bbox(network_sf)) %>% st_buffer(100)
+  target_crashes <- target_crashes[net_bbox, ]
+  
+  if(nrow(target_crashes) == 0) {
+    message("No crashes found in this network extent.")
+    # Return empty structures if no crashes
+  }
+  
+  # 3. STRICT 1-TO-1 MATCHING (Prevents all duplication)
+  # Find the single nearest network feature for every crash
+  nearest_idx <- st_nearest_feature(target_crashes, network_sf)
+  
+  # Calculate the exact distance to that nearest feature
+  exact_dists <- st_distance(target_crashes, network_sf[nearest_idx, ], by_element = TRUE)
+  
+  # Add the matched network index and distance to the crashes dataset
+  target_crashes$matched_net_idx <- nearest_idx
+  target_crashes$snap_dist_m <- as.numeric(exact_dists)
+  
+  # 4. Filter out crashes that are too far away
+  max_dist <- ifelse(is_node, 15, 10)
+  valid_crashes <- target_crashes %>% filter(snap_dist_m <= max_dist)
+  
+  # 5. Summarize crashes per network feature
+  crash_summary <- valid_crashes %>%
+    st_drop_geometry() %>%
+    group_by(matched_net_idx) %>%
+    summarise(
+      crash_count = n(),
+      # We can aggregate specific injuries here if you want to inspect them!
+      fatal_count = sum(severity_ord == "Fatal", na.rm = TRUE),
+      severe_count = sum(severity_ord == "Severe", na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # 6. Join back to the main network
+  vol_col <- ifelse(mode_name == "Bike", "pred_bike_vol", "pred_ped_vol")
+  
+  network_sf <- network_sf %>%
+    mutate(net_idx = row_number()) %>%
+    left_join(crash_summary, by = c("net_idx" = "matched_net_idx")) %>%
+    mutate(
+      crash_count = replace_na(crash_count, 0),
+      has_crash = ifelse(crash_count > 0, 1, 0),
+      
+      # Safe vars for modeling
+      vol_safe = ifelse(.data[[vol_col]] <= 0, 0.1, as.numeric(.data[[vol_col]])),
+      len_miles = if (is_node) 1 else (as.numeric(length_ft) / 5280),
+      len_miles = ifelse(len_miles <= 0, 0.001, len_miles)
+    ) %>%
+    select(-net_idx)
+  
+  # 7. Prepare Frequency Dataset
+  freq_data <- network_sf %>% st_drop_geometry()
+  
+  # 8. Prepare Severity Dataset (Crash Level)
+  # Instead of using overlapping lists, we just pull the valid crashes directly
+  if (nrow(valid_crashes) > 0) {
+    sev_data <- valid_crashes %>%
+      st_drop_geometry() %>%
+      select(matched_net_idx, severity_ord) %>%
+      left_join(
+        network_sf %>% mutate(net_idx = row_number()) %>% st_drop_geometry(),
+        by = c("matched_net_idx" = "net_idx")
+      ) %>%
+      filter(!is.na(severity_ord))
+  } else {
+    sev_data <- NULL
+  }
+  
+  return(list(
+    freq_data = freq_data,
+    sev_data = sev_data,
+    mode = mode_name,
+    is_node = is_node
+  ))
 }
 
 #' Fetch Weather for Multiple Stations and return SF
@@ -67,7 +218,7 @@ get_spatial_weather <- function(station_ids, year = 2023) {
 
 #' Enrich Bike Network Links (The "Spine" Function)
 #' This updates EVERY link in the master network with covariates
-#' Consolidates Strava, SLD, Walk Index, Crashes, and Weather into one SF object
+#' Consolidates Strava, SLD, Walk Index, and Weather into one SF object
 #' Enrich Strava Spine with OSM by table join (assuming osm_id is correct)
 #' 
 # --- 1. STABLE BASE ENRICHMENT ---
@@ -107,34 +258,7 @@ enrich_base_network <- function(strava_sf, osm_sf, sld_sf, wi_sf, weather_sf) {
     left_join(centroids_data, by = "edge_uid")
 }
 
-# --- 2. CRASH ENRICHMENT (The High-Speed Modular Step) ---
-enrich_crashes <- function(strava_sf, crash_sf) {
-  # Identifying which chunk this is by its row count
-  chunk_id <- paste0("Chunk (", nrow(strava_sf), " rows)")
-  
-  message(paste(chunk_id, "--- Starting Crash Join ---"))
-  
-  # Step 1: Bounding Box
-  message(paste(chunk_id, ": Step 1/3 - Filtering Crashes by BBox..."))
-  chunk_bbox <- st_as_sfc(st_bbox(strava_sf)) %>% st_buffer(100)
-  crash_subset <- crash_sf[chunk_bbox, ]
-  message(paste(chunk_id, ": Found", nrow(crash_subset), "crashes in vicinity."))
-  
-  # Step 2: Buffering
-  message(paste(chunk_id, ": Step 2/3 - Creating 30m road buffers..."))
-  strava_buffer <- st_buffer(strava_sf, 30, endCapStyle = "SQUARE", joinStyle = "MITRE")
-  
-  # Step 3: Intersection
-  message(paste(chunk_id, ": Step 3/3 - Performing Point-in-Polygon check..."))
-  intersect_list <- st_intersects(strava_buffer, crash_subset)
-  
-  strava_sf$crash_count_30m <- lengths(intersect_list)
-  
-  message(paste(chunk_id, "--- FINISHED ---"))
-  return(strava_sf)
-}
-
-# --- 3. CENSUS ENRICHMENT (The missing blocks_optimized link)
+# --- 2. CENSUS ENRICHMENT (The missing blocks_optimized link)
 enrich_census <- function(strava_sf, census_sf) {
   message("...Joining Census Block Data")
   
@@ -164,7 +288,7 @@ enrich_census <- function(strava_sf, census_sf) {
     left_join(census_join, by = "edge_uid")
 }
 
-# --- 4. FINAL MATH ---
+# --- 3. FINAL MATH ---
 calculate_model_features <- function(strava_sf) {
   
   # 1. UNWRAP list
@@ -257,8 +381,7 @@ calculate_model_features <- function(strava_sf) {
     speed_limit      = fast_coalesce(df_clean, "speed_limit"),
     
     # --- ENVIRONMENTAL/SAFETY (Prior Weather/Crash Joins) ---
-    precip_annual    = fast_coalesce(df_clean, "prcp_annua"),
-    crash_count_30m  = replace_na(fast_coalesce(df_clean, "crash_count_30m"), 0)
+    precip_annual    = fast_coalesce(df_clean, "prcp_annua")
   ) %>%
     mutate(
       # Bias adjustment calculation
@@ -436,7 +559,7 @@ snap_counts_to_network <- function(counts_df, network_list) {
 }
 
 # --- Prepare Census Blocks for Web Tool in chunks---
-enrich_census_chunk <- function(census_chunk, sld_sf, wi_sf, crash_sf, weather_sf) {
+enrich_census_chunk <- function(census_chunk, sld_sf, wi_sf, weather_sf) {
   
   # 1. Setup & CRS Safety
   # Ensure the chunk is valid and ready
@@ -444,24 +567,11 @@ enrich_census_chunk <- function(census_chunk, sld_sf, wi_sf, crash_sf, weather_s
   target_crs  <- st_crs(blocks_proj)
   
   # Fast CRS check: If mismatched, project inputs to match the chunk
-  if (st_crs(crash_sf)   != target_crs) crash_sf   <- st_transform(crash_sf, target_crs)
   if (st_crs(sld_sf)     != target_crs) sld_sf     <- st_transform(sld_sf, target_crs)
   if (st_crs(wi_sf)      != target_crs) wi_sf      <- st_transform(wi_sf, target_crs)
   if (st_crs(weather_sf) != target_crs) weather_sf <- st_transform(weather_sf, target_crs)
-  
-  # 2. Crash Aggregation (Optimized Fast Path)
-  # Calculate area first
-  blocks_proj <- blocks_proj %>% 
-    mutate(
-      area_sqm  = as.numeric(st_area(.)), 
-      area_sqkm = area_sqm / 1e6
-    )
-  
-  # Fast Count (st_intersects is much faster than st_join for pure counts)
-  crash_hits <- st_intersects(blocks_proj, crash_sf)
-  blocks_proj$crash_count <- lengths(crash_hits)
-  
-  # 3. Environment (SLD/WI) - Centroid Sampling
+
+  # 2. Environment (SLD/WI) - Centroid Sampling
   # Using centroids avoids "edge" issues where a block touches 2 zones
   block_centroids <- st_centroid(blocks_proj)
   
@@ -471,11 +581,11 @@ enrich_census_chunk <- function(census_chunk, sld_sf, wi_sf, crash_sf, weather_s
     st_drop_geometry() %>%
     select(BLOCKID10, D1B, D3b, NatWalkInd)
   
-  # 4. Weather (Nearest Neighbor)
+  # 3. Weather (Nearest Neighbor)
   nearest_idx  <- st_nearest_feature(block_centroids, weather_sf)
   weather_vals <- weather_sf$prcp_annua[nearest_idx]
   
-  # 5. Merge & Format Columns
+  # 4. Merge & Format Columns
   enriched_chunk <- blocks_proj %>%
     left_join(sld_wi_data, by = "BLOCKID10") %>%
     mutate(across(
@@ -513,8 +623,6 @@ enrich_census_chunk <- function(census_chunk, sld_sf, wi_sf, crash_sf, weather_s
       community_low = COMMUNI_02, community_high = COMMUNI_01,
       transit_low = TRANSIT_LO, transit_high = TRANSIT_HI,
       
-      # --- Density Calculation ---
-      crash_density = crash_count / pmax(area_sqkm, 0.001)
     ) %>%
     mutate(across(where(is.numeric), ~replace_na(., 0)))
   
@@ -584,7 +692,7 @@ prepare_web_blocks <- function(enriched_chunks, min_sqm_threshold = 1000) {
       retail_low, retail_high, supermarket_low, supermarket_high,
       parks_low, parks_high, trails_low, trails_high,
       community_low, community_high, transit_low, transit_high,
-      precip_annual, crash_density
+      precip_annual
     ) %>%
     mutate(across(where(is.numeric), ~replace_na(., 0))) %>%
     st_transform(4326)
