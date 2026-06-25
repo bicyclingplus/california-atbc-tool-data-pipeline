@@ -202,14 +202,32 @@ match_strava_to_osm <- function(strava_base, osm_processed) {
   
   # The Join
   result <- left_join(strava_base, osm_processed, by = c("osm_ref" = "osm_id"))
-  
+
+  # Deduplicate edge_uid. The per-district Strava clips overlap at Caltrans
+  # district boundaries, so the same physical edge (identical geometry AND
+  # strava volume) appears in two files -> duplicate edge_uid rows. Verified as
+  # true duplicates. Left undropped they (a) double-count Strava on boundary
+  # edges and (b) make the downstream centroid joins many-to-many, which blows
+  # up row counts (OOM) once spatial tiling concentrates them into seam tiles.
+  # Keep the first occurrence per edge_uid; geometry/volume are identical so this
+  # is lossless. Guards against OSM-join multiplication too. Use base-R
+  # !duplicated() rather than dplyr::distinct(): distinct() on a ~7.8M-row sf
+  # drags the geometry list-column through its grouping machinery and is
+  # extremely slow; a single logical subset via sf's fast `[` is orders faster.
+  n_before <- nrow(result)
+  result   <- result[!duplicated(result$edge_uid), ]
+  if (n_before > nrow(result)) {
+    message(paste0("--- Dropped ", n_before - nrow(result),
+                   " duplicate edge_uid rows (boundary overlaps) ---"))
+  }
+
   # The CORRECT diagnostic check
   total_rows <- nrow(result)
   matched_rows <- sum(!is.na(result$infra_type)) # Check infra_type, not highway!
   match_rate <- round((matched_rows / total_rows) * 100, 2)
-  
+
   message(paste0("--- Join Success: ", match_rate, "% ---"))
-  
+
   return(result)
 }
 
@@ -219,45 +237,53 @@ match_strava_to_osm <- function(strava_base, osm_processed) {
 build_topology_from_links <- function(links_sf) {
   library(sf)
   library(dplyr)
-  library(digest)
-  
+
   message("...Building Topology: Generating stable IDs and Nodes")
-  
-  # 1. GENERATE LINK IDs
-  # We use MD5 hashing of coordinates to ensure ID stability
+
+  # GENERATE LINK IDs based on coordinates. If coordinates change we get a new
+  # ID; otherwise IDs are stable across rebuilds (the key is the rounded
+  # coordinate, not row order).
   coords <- st_coordinates(links_sf)
-  
-  # Identify start/end indices for each line
-  start_idx <- match(unique(coords[,"L1"]), coords[,"L1"])
-  end_idx   <- nrow(coords) - match(unique(coords[,"L1"]), rev(coords[,"L1"])) + 1
-  
-  # Helper to make hash
-  get_hash <- function(idx) {
-    # Format: "X_Y" rounded to 6 decimals
-    txt <- paste(round(coords[idx, 1], 6), round(coords[idx, 2], 6), sep="_")
-    purrr::map_chr(txt, ~digest::digest(.x, algo="md5", serialize=FALSE))
+  L1 <- coords[, "L1"]
+  n  <- nrow(coords)
+
+  # Start index of each line = first row where L1 changes; end index = last row
+  # before the next line. Vectorized: no per-line match()/rev() scan.
+  is_start <- c(TRUE, L1[-1] != L1[-n])
+  start_idx <- which(is_start)
+  end_idx   <- c(start_idx[-1] - 1L, n)
+
+  # Coordinate key "x_y" rounded to 6 dp -- STRING key, stable across rebuilds
+  # (same coordinate always yields the same id). Only the ~2*n_lines endpoints
+  # are stringified, not every vertex, and via one sprintf() call rather than
+  # paste(round(),round()). Output is byte-identical to the old paste form.
+  hash_xy <- function(idx) {
+    sprintf("%s_%s", as.character(round(coords[idx, 1], 6)),
+                     as.character(round(coords[idx, 2], 6)))
   }
-  
-  # Assign IDs to the links
-  links_sf$from <- get_hash(start_idx)
-  links_sf$to   <- get_hash(end_idx)
-  
-  # 2. GENERATE NODES
-  # We extract the geometry immediately using the same IDs
-  node_ids_ordered <- c(rbind(links_sf$from, links_sf$to)) # Interleave Start, End
-  
-  # Create simple node SF
-  nodes_sf <- coords %>%
-    as_tibble() %>%
-    group_by(L1) %>%
-    slice(c(1, n())) %>% # Keep first and last points
-    ungroup() %>%
-    mutate(node_id = node_ids_ordered) %>%
-    distinct(node_id, .keep_all = TRUE) %>% # Remove duplicates
-    st_as_sf(coords = c("X", "Y"), crs = st_crs(links_sf))
-  
+  links_sf$from <- hash_xy(start_idx)
+  links_sf$to   <- hash_xy(end_idx)
+
+  # GENERATE NODES -- one geometry per unique node_id.
+  # Interleave start/end so node_ids_ordered[i] matches endpoint row i below.
+  node_ids_ordered <- c(rbind(links_sf$from, links_sf$to))
+  endpoint_rows    <- c(rbind(start_idx, end_idx))   # coord rows, same interleave
+
+  # Deduplicate on node_id WITHOUT a 43.7M-row group_by/slice: take the coord
+  # rows at the line endpoints, keep the first occurrence of each node_id.
+  keep <- !duplicated(node_ids_ordered)
+  nodes_sf <- st_as_sf(
+    data.frame(
+      node_id = node_ids_ordered[keep],
+      X = coords[endpoint_rows[keep], 1],
+      Y = coords[endpoint_rows[keep], 2]
+    ),
+    coords = c("X", "Y"), crs = st_crs(links_sf)
+  )
+
   return(list(links = links_sf, nodes = nodes_sf))
 }
+
 
 #' Map volumes from links to nodes and nodes to links
 map_volumes_across_network <- function(links, nodes) {

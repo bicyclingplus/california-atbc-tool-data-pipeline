@@ -1,31 +1,29 @@
+# Data pipeline with R targets package on R 4.2.3
+# requires...
 library(targets)
 library(tarchetypes)
 library(furrr)
 library(crew)
 
-# Source all functions (including src/functions/expansions.R)
-tar_source("src/functions")
+# Hard coding functions source becuase I'm sourcing from a local git repo while
+# the pipeline runs with the working directory set to the cloud drive (Box) 
+# Expected working dir to be cloud drive project root so that data paths 
+# ("data_raw/...") and the _targets store live on the cloud drive.
+tar_source("C:/Users/Dillon/projects/california-atbc-tool-data-pipeline/src/functions")
 
 tar_option_set(
   packages = c("tidyverse", "sf", "lubridate", "osmextract", "nngeo", "zip",
-               "ranger", "readr", "purrr", "furrr", "httr", "jsonlite"),
-  controller = crew_controller_local(workers = 8), # adjust depending on RAM for target
-  memory = "persistent", # Keep data in RAM so workers don't reload from disk
+               "readr", "purrr", "furrr", "httr", "jsonlite",
+               "lightgbm", "terra", "prism", "rsample", "digest"),
+  # 4 crew workers for the parallel (mapped) enrichment targets.
+  controller = crew_controller_local(workers = 4),
+  # transient: free each target's data once its dependents finish so the
+  # memory-heavy main-process targets (topology, snap) don't accumulate every
+  # upstream object in RAM (the old "persistent" setting paged at ~50 GB). If a
+  # target turns out to need its deps kept resident, override per-target with
+  # tar_target(..., memory = "persistent").
+  memory = "transient",
   garbage_collection = TRUE
-)
-
-# ============================================================================
-# Weather Stations
-# ============================================================================
-ca_stations <- c(
-  "ACV", "CEC", "EKA", "UKI", "STS", "FRBC1", "SCOC1",
-  "SFO", "OAK", "SJC", "APC", "LVK", "HWD", "MRY", "SNS", "SBP", "SBA", "OXR", "KENC1",
-  "SAC", "SMF", "RDD", "DAVC1", "CHUC1", "AUBC1", "MHS", "BLU", "AAT", "O05",
-  "MOD", "FAT", "VIS", "BFL", "MCE", "MER", "USC00045502",
-  "TVL", "TRK", "BIH", "MMH", "RNO", "BODC1", "DWNC1",
-  "LAX", "BUR", "LGB", "SNA", "VNY", "ONT", "PMD", "WJF", "CQT",
-  "PSP", "TRM", "IPL", "SBD", "RIV", "RIR", "DAG", "NID", "EDW",
-  "SAN", "CRQ", "SEE", "RNM", "NKX", "CZZ"
 )
 
 
@@ -52,7 +50,7 @@ list(
   # ============================================================================
   # SECTION 2: CONTEXT LAYERS (SLD, WI, Crash, Weather)
   # ============================================================================
-  
+  # smart location data and national walk index data 
   tar_target(sld_shp_file, "data_raw/SLD/SmartLocationDb.shp", format = "file"),
   tar_target(wi_shp_file, "data_raw/SLD/Natl_WI.shp", format = "file"),
   
@@ -77,12 +75,15 @@ list(
       select(GEOID10, NatWalkInd)
   ),
   
-  # NOAA Weather Data (Annual Precipitation)
+  # PRISM 4km annual climate (ppt / tmin / tmax), auto-downloaded + cached.
+  # Tracked as a file target (the three .bil paths).
   tar_target(
-    weather_data,
-    get_spatial_weather(ca_stations, 2023)
+    prism_paths,
+    get_prism_climate(2023),
+    format = "file"
   ),
   
+  # TIMS processed switrs data
   tar_target(switrs_file, "data_raw/switrs_2019_2023/CRASH_PED_BIKE_2019-2023_20240912.csv", format = "file"),
   tar_target(processed_crash, process_switrs_data(switrs_file)),
   
@@ -94,171 +95,180 @@ list(
   # ============================================================================
   # SECTION 3: COUNT DATA (Ground Truth)
   # ============================================================================
+  # files from UCB SafeTREC
   tar_target(ucb_bike_file, "data_raw/ucb_bike_AADB/Model_clean_data_july23_AADBT.csv", format = "file"),
   tar_target(ucb_ped_file, "data_raw/ucb_ped_AADP/PSIP_allvars_20200503_wSHS_newFC.csv", format = "file"),
   
   tar_target(ucb_bike_clean, load_ucb_bike(ucb_bike_file)),
   tar_target(ucb_ped_clean, load_ucb_ped(ucb_ped_file)),
   
+  # files from https://data.ca.gov/dataset/at-count-dataset
   tar_target(caltrans_bike_files, list.files("data_raw/atd", pattern = "caltrans_bicycle.*\\.csv", full.names = TRUE)),
   tar_target(caltrans_ped_files, list.files("data_raw/atd", pattern = "caltrans_pedestrian.*\\.csv", full.names = TRUE)),
   
   tar_target(caltrans_bike_clean, process_caltrans_counts(caltrans_bike_files, mode = "bike")),
   tar_target(caltrans_ped_clean, process_caltrans_counts(caltrans_ped_files, mode = "ped")),
+
+  # CAT Data Portal counts (catdataportal.berkeley.edu) -- ~3,400 mostly-new sites
+  # incl. Trail / Mid-block facilities the UCB data lacks. Hourly counts expanded
+  # via the internal-seasonality method; de-duplicated against UCB sites.
+  tar_target(
+    catportal_files,
+    list.files("data_raw/catdp", pattern = "\\.csv\\.gz$|counts_zip_metadata\\.csv$", full.names = TRUE),
+    format = "file"
+  ),
+  tar_target(
+    catportal_clean,
+    load_catportal_counts(
+      catdp_dir = "data_raw/catdp",
+      ucb_sites = bind_rows(
+        ucb_bike_clean %>% select(lat, lon),
+        ucb_ped_clean  %>% select(lat, lon)
+      ),
+      dedup_dist_m = 30
+    )
+  ),
+  tar_target(catportal_bike_clean, catportal_clean %>% filter(mode == "bike")),
+  tar_target(catportal_ped_clean,  catportal_clean %>% filter(mode == "ped")),
+
+  tar_target(all_bike_points, bind_rows(ucb_bike_clean, caltrans_bike_clean, catportal_bike_clean)),
+  tar_target(all_ped_points, bind_rows(ucb_ped_clean, caltrans_ped_clean, catportal_ped_clean)),
   
-  tar_target(all_bike_points, bind_rows(ucb_bike_clean, caltrans_bike_clean)),
-  tar_target(all_ped_points, bind_rows(ucb_ped_clean, caltrans_ped_clean)),
-  
-  tar_target(ground_truth_counts, bind_rows( all_bike_points,all_ped_points)),
+  tar_target(ground_truth_counts, bind_rows(all_bike_points, all_ped_points)),
   
   # ============================================================================
-  # SECTION 4: DATA ENRICHMENT (FIXED & CLEANED)
+  # SECTION 4: DATA ENRICHMENT
   # ============================================================================
-  
-  # 1. Split the Strava spine once
+
+  # Split the Strava target into 8 chunks for the parallel (mapped) enrichment.
   tar_group_count(
     strava_chunks,
-    master_network, 
+    master_network,
     count = 8
   ),
-  
-  # 2. Base Joins (OSM, SLD, WI, Weather - all together)
+
+  # Base Joins (OSM, SLD, WI, Weather - all together)
   tar_target(
     strava_base,
-    enrich_base_network(strava_chunks, osm_processed, sld_data, wi_data, weather_data),
+    enrich_base_network(strava_chunks, osm_processed, sld_data, wi_data, prism_paths),
     pattern = map(strava_chunks),
     iteration = "list"
   ),
-  
-  # 3. Crashes (The fast, separate step)
+
+  # Crashes
   tar_target(processed_crash_proj, st_transform(processed_crash, 3310)),
-  
+
   tar_target(
     strava_with_crashes,
     enrich_crashes(strava_base, processed_crash_proj),
     pattern = map(strava_base),
     iteration = "list"
   ),
-  
-  # 4. Census joins
+
+  # Census joins
   tar_target(
     strava_with_census,
     enrich_census(strava_with_crashes, census_blocks),
     pattern = map(strava_with_crashes),
     iteration = "list"
   ),
-  
-  # 5. Final Math
+
+  # Final Model Feature Calculations
   tar_target(
     enriched_strava_chunks,
     calculate_model_features(strava_with_census),
     pattern = map(strava_with_census),
     iteration = "list"
   ),
-  
-  # 5. Re-combine into Master
+
+  # Re-combine chunks into Master
   tar_target(
     enriched_bike_network,
     bind_rows(enriched_strava_chunks) %>% st_as_sf()
   ),
-  
-  # 6. Partition data for modeling
-  # Takes ~1.25 hrs
-  tar_target(
-    network_topology, 
-    prep_network_topology(enriched_bike_network)
-  ),
-  
-  # Snapping (Fast iteration)
-  tar_target(
-    partitioned_data, 
-    snap_counts_to_network(ground_truth_counts, network_topology)
-  ),
-  
-  # ============================================================================
-  # SECTION 5: MODELING & VALIDATION (NEW)
-  # ============================================================================
-  
-  # 1. Extract Training Data (replace all NAs with 0)
-  tar_target(
-    bike_train, 
-    partitioned_data$links_train %>% 
-      mutate(across(where(is.numeric), ~tidyr::replace_na(., 0)))
-  ),
-  tar_target(
-    ped_train,  
-    partitioned_data$nodes_train %>% 
-      mutate(across(where(is.numeric), ~tidyr::replace_na(., 0)))
-  ),
-  
-  # 2. Validation (10-Fold Spatial CV)
-  # 'crew' will run val_bike and val_ped in parallel on different workers.
-  
-  # Bike Random Forest (Ranger)
-  tar_target(
-    val_bike_rf,
-    validate_model_10fold(bike_train, mode = "bike", model_type = "ranger")
-  ),
-  
-  # Bike Poisson Boosting (GBM)
-  tar_target(
-    val_bike_gbm,
-    validate_model_10fold(bike_train, mode = "bike", model_type = "gbm")
-  ),
-  
-  # Ped Random Forest (Ranger)
-  tar_target(
-    val_ped_rf,
-    validate_model_10fold(ped_train, mode = "ped", model_type = "ranger")
-  ),
-  
-  # Ped Poisson Boosting (GBM)
-  tar_target(
-    val_ped_gbm,
-    validate_model_10fold(ped_train, mode = "ped", model_type = "gbm")
-  ),
-  # Combines "Pooled" metrics from all 4 models into one master table
-  tar_target(
-    model_comparison_results,
-    bind_rows(
-      val_bike_rf$metrics_pooled  %>% mutate(mode = "bike", model_type = "ranger"),
-      val_bike_gbm$metrics_pooled %>% mutate(mode = "bike", model_type = "gbm"),
-      val_ped_rf$metrics_pooled   %>% mutate(mode = "ped",  model_type = "ranger"),
-      val_ped_gbm$metrics_pooled  %>% mutate(mode = "ped",  model_type = "gbm")
-    )
-  ),
-  # Ranger RF model performs best
 
+  # Build network topology (links from/to + node geometry/attributes) over the
+  # full network. deployment="main"; memory="transient" (global) keeps upstream
+  # objects from accumulating here.
+  tar_target(
+    network_topology,
+    prep_network_topology(enriched_bike_network),
+    deployment = "main"
+  ),
+
+  # Snap ground-truth counts onto the network (bike -> links via axis assignment,
+  # ped -> nearest node). deployment="main".
+  tar_target(
+    partitioned_data,
+    snap_counts_to_network(ground_truth_counts, network_topology),
+    deployment = "main"
+  ),
   
-  # 3. Train Final Models (Full Data)
-  # 'crew' will run these in parallel. 
-  # Train final Ranger models on ALL data
-  tar_target(model_bike_final, train_model(bike_train, mode = "bike", model_type = "ranger")),
-  tar_target(model_ped_final, train_model(ped_train,  mode = "ped",  model_type = "ranger")),
+  # Ambient Strava demand field (raster focal-sum), added later -----------
+  # Attempted vector operatoins that were far too computationally intensive, so 
+  # shifted to raster with output stored as a .tif file target. All
+  # ambient extractions below are fast lookups against it.
+  tar_target(
+    strava_grid,
+    build_strava_grid(master_network, "data_processed/strava_grid.tif"),
+    format = "file",
+    deployment = "main"
+  ),
+
+  # ============================================================================
+  # SECTION 5: MODELING (LightGBM Tweedie)
+  # ============================================================================
+  # --- Training data: snapped counts + ambient features ----------------------
+  tar_target(
+    bike_train,
+    partitioned_data$links_train %>%
+      mutate(across(where(is.numeric), ~tidyr::replace_na(., 0))) %>%
+      bind_cols(extract_ambient(strava_grid, .))
+  ),
+  tar_target(
+    ped_train,
+    partitioned_data$nodes_train %>%
+      mutate(across(where(is.numeric), ~tidyr::replace_na(., 0))) %>%
+      bind_cols(extract_ambient(strava_grid, .))
+  ),
+
+  # --- Validation (spatial 10-fold; reports class accuracy + absolute error) -
+  # Track A = existing network (with on-link Strava); Track B = new off-street
+  # paths (Strava-free, for the web tool). crew runs these in parallel.
+  tar_target(val_bike_A, validate_lgb(bike_train, PREDICTORS_A, "aadb")),
+  tar_target(val_bike_B, validate_lgb(bike_train, PREDICTORS_B, "aadb")),
+  tar_target(val_ped_A,  validate_lgb(ped_train,  PREDICTORS_A, "aadp")),
+  tar_target(val_ped_B,  validate_lgb(ped_train,  PREDICTORS_B, "aadp")),
+
+  # --- Final models trained on ALL data --------------------------------------
+  tar_target(model_bike_A, train_lgb(bike_train, PREDICTORS_A, "aadb")),  # existing network
+  tar_target(model_ped_A,  train_lgb(ped_train,  PREDICTORS_A, "aadp")),
+  tar_target(model_bike_B, train_lgb(bike_train, PREDICTORS_B, "aadb")),  # new paths (web tool)
+  tar_target(model_ped_B,  train_lgb(ped_train,  PREDICTORS_B, "aadp")),
   
   # ============================================================================
   # SECTION 6: PREDICTIONS
   # ============================================================================
   
-  # 1. Unpack the "Empty" Networks for Prediction, need to add year for prediction
-  # 
-  tar_target(network_links, 
-             partitioned_data$links_predict %>% 
-               mutate(year = 2023)
+  # Prediction networks + ambient features (fast lookup against strava_grid).
+  tar_target(network_links,
+             partitioned_data$links_predict %>% bind_cols(extract_ambient(strava_grid, .)),
+             deployment = "main"
   ),
-  tar_target(network_nodes, partitioned_data$nodes_predict %>% 
-               mutate(year = 2023)
+  tar_target(network_nodes,
+             partitioned_data$nodes_predict %>% bind_cols(extract_ambient(strava_grid, .)),
+             deployment = "main"
   ),
-  
-  # 2. Generate Predictions (Split Method)
-  # Maps bike volumes to Links and ped volumes to Nodes
+
+  # Generate Predictions (Track A models: on-link Strava available on the
+  # existing network). Maps bike volumes to Links and ped volumes to Nodes.
   tar_target(
     final_predictions,
     predict_split_networks(
-      bike_model = model_bike_final, 
-      ped_model  = model_ped_final,
-      link_net   = network_links,   
-      node_net   = network_nodes    
+      bike_model = model_bike_A,
+      ped_model  = model_ped_A,
+      link_net   = network_links,
+      node_net   = network_nodes
     )
   ),
   
@@ -266,7 +276,7 @@ list(
   # SECTION 7: WEBTOOL specific data prep and models
   # ============================================================================
   
-  # 1. Group Census Blocks for Parallel Processing
+  # Group Census Blocks for Parallel Processing
   # Split 400k blocks into 32 chunks
   tar_group_count(
     census_chunks,
@@ -274,21 +284,21 @@ list(
     count = 32
   ),
   
-  # 2. Enrich Chunks in Parallel
+  # Enrich Chunks in Parallel
   tar_target(
     web_blocks_raw_chunks,
     enrich_census_chunk(
       census_chunk = census_chunks,
       sld_sf       = sld_data,         
       wi_sf        = wi_data,          
-      crash_sf     = processed_crash,  
-      weather_sf   = weather_data      
+      crash_sf     = processed_crash,
+      prism_paths  = prism_paths
     ),
     pattern = map(census_chunks),
     iteration = "list"
   ),
   
-  # 3. Combine & Finalize
+  # Combine & Finalize
   tar_target(
     web_context_map,
     prepare_web_blocks(
@@ -296,70 +306,26 @@ list(
       min_sqm_threshold = 1000
     )
   ),
-  
-  # 4. Validation: Bike Model ---
-  tar_target(
-    hglm_cv_bike,
-    validate_hglm_kfold(
-      data = bike_train,
-      mode_arg = "bike",
-      target_col = "aadb",
-      id_col = "spatial_id",
-      k = 10
-    )
-  ),
-  
-  # 5. Validation: Pedestrian Model ---
-  tar_target(
-    hglm_cv_ped,
-    validate_hglm_kfold(
-      data = ped_train,
-      mode_arg = "ped",
-      target_col = "aadp",
-      id_col = "spatial_id",
-      k = 10
-    )
-  ),
-  
-  # 6. Final Training: Bike Model ---
-  tar_target(
-    hglm_model_bike,
-    train_hglm(
-      train_data = bike_train,
-      mode_arg = "bike",
-      target_col = "aadb",
-      id_col = "spatial_id"
-    )
-  ),
-  
-  # 7. Final Training: Pedestrian Model ---
-  tar_target(
-    hglm_model_ped,
-    train_hglm(
-      train_data = ped_train,
-      mode_arg = "ped",
-      target_col = "aadp",
-      id_col = "spatial_id"
-    )
-  ),
-  
+
   # ============================================================================
   # SECTION 8: WEBTOOL OUTPUTS
   # ============================================================================
-  
-  # 8.1 Extract Marginalized Equations (Fixed Effects Only)
+
+  # Export Track B models for the Node.js web tool (new-path prediction).
+  # LightGBM -> text and JSON and a JSON feature-spec. post-pipeline
+  # python stripc (convert_to_onnx.py) needed to convert to ONNX (onnxruntime-node)
   tar_target(
     web_model_assets_file,
-    export_web_model_assets(
-      hglm_ped = hglm_model_ped, 
-      hglm_bike = hglm_model_bike, 
-      output_path = "data_processed/model_coefficients.csv"
+    export_models_for_node(
+      bike_model = model_bike_B,
+      ped_model  = model_ped_B,
+      out_dir    = "data_processed/web_models"
     ),
     format = "file"
   ),
   
-  # 8.2 Prepare Web Context Blocks 
-  # We only keep the geographic predictors. 
+  # Prepare Web Context Blocks 
+  # Only keeping the geographic predictors. 
   # Note: Year and Network vars are handled by the web UI, not the spatial join.
   tar_target(
     web_blocks_export_file,
@@ -370,8 +336,8 @@ list(
     format = "file"
   ),
   
-  # 8.3 Map Volumes Across Network
-  # Cross-pollinates bike volumes to nodes, and ped volumes to links using your network_utils function
+  # Map Volumes Across Network
+  # Spreads bike volumes to nodes, and ped volumes to links
   tar_target(
     web_ready_network,
     map_volumes_across_network(
@@ -379,18 +345,18 @@ list(
       nodes = final_predictions$nodes
     )
   ),
-  
-  # 8.4 Finalize Web Network Attributes
+
+  # Finalize Web Network Attributes
   # Calculates exposure classes, maps functional classifications, calculates lengths, and renames fields
   tar_target(
     final_web_network,
     finalize_web_network(
-      links = web_ready_network$links, 
+      links = web_ready_network$links,
       nodes = web_ready_network$nodes
     )
   ),
   
-  # 8.5 Generate Localized Safety Appendix A (CSVs)
+  # Generates Localized Safety Appendix A (CSVs)
   # Uses the finalized assets so that `exposure_class` and `functional` are present for the aggregation
   tar_target(
     appendix_a_csvs,
@@ -404,7 +370,7 @@ list(
     format = "file"
   ),
   
-  # 8.6 Export Final Network Layers (GeoJSON)
+  # Export Final Network Layers (GeoJSON)
   tar_target(
     export_links_geojson,
     {

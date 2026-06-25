@@ -17,8 +17,8 @@ export_web_model_assets <- function(hglm_ped, hglm_bike, output_path) {
   
   # 2. Combine and Transform
   coeffs <- bind_rows(
-    get_fixed_effects(hglm_ped, "ped"),
-    get_fixed_effects(hglm_ped, "bike")
+    get_fixed_effects(hglm_ped,  "ped"),
+    get_fixed_effects(hglm_bike, "bike")
   ) %>%
     mutate(
       # Define UI Data Dictionary
@@ -29,7 +29,8 @@ export_web_model_assets <- function(hglm_ped, hglm_bike, output_path) {
         coef == "speed_limit" ~ "numeric: 5-65",
         grepl("infra_type", coef) ~ "binary_flag: 0, 1",
         coef %in% c("emp_density", "int_density", "walk_index", "housing_total") ~ "numeric: density_value",
-        coef == "precip_annual" ~ "numeric: annual_inches",
+        coef == "precip_annual" ~ "numeric: annual_mm",
+        coef %in% c("temp_min", "temp_max") ~ "numeric: annual_degC",
         grepl("low$|high$", coef) ~ "numeric: buffer_count",
         TRUE ~ "numeric"
       ),
@@ -76,7 +77,7 @@ prepare_and_export_web_blocks <- function(data, output_path) {
         "retail_low", "retail_high", "supermarket_low", "supermarket_high",
         "parks_low", "parks_high", "trails_low", "trails_high",
         "community_low", "community_high", "transit_low", "transit_high",
-        "precip_annual"
+        "precip_annual", "temp_min", "temp_max"
       ))
     )
   
@@ -202,4 +203,55 @@ generate_localized_appendix_a <- function(links, nodes, processed_crash_proj,
   write_csv(appendix_a_nodes, output_path_nodes)
   
   return(c(output_path_links, output_path_nodes))
+}
+# ============================================================================
+# Export Track B (Strava-free) models for the Node.js web tool.
+# ----------------------------------------------------------------------------
+# Writes, per mode, the canonical LightGBM artifacts plus a JSON feature-spec so
+# Node can build the input vector identically. ONNX conversion (for
+# onnxruntime-node) is a separate one-time step: scripts/convert_to_onnx.py.
+#
+# Outputs (returned as a character vector for a format="file" target):
+#   <out_dir>/<mode>_model.txt      LightGBM text model (canonical; lgb.save)
+#   <out_dir>/<mode>_model.json     lgb.dump (tree structure, JS-parseable)
+#   <out_dir>/<mode>_feature_spec.json  predictors, one-hot column order, transforms
+# ============================================================================
+export_models_for_node <- function(bike_model, ped_model, out_dir) {
+  require(lightgbm); require(jsonlite)
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+  write_one <- function(model, mode) {
+    txt  <- file.path(out_dir, paste0(mode, "_model.txt"))
+    json <- file.path(out_dir, paste0(mode, "_model.json"))
+    spec <- file.path(out_dir, paste0(mode, "_feature_spec.json"))
+
+    # model is a stored lgb_model (text + metadata). Reconstitute a live Booster.
+    booster <- lgb_booster(model)
+    lightgbm::lgb.save(booster, txt)
+    writeLines(lightgbm::lgb.dump(booster), json)
+
+    # Feature contract: the exact one-hot column order the model expects, the
+    # raw predictors, which are categorical, and the transforms Node must apply.
+    train_cols <- model$train_cols
+    predictors <- model$predictors
+    spec_list <- list(
+      mode = mode,
+      target = model$target,
+      objective = "tweedie",
+      note = "LightGBM Tweedie returns predictions on the COUNT scale (already exp-linked). Do NOT exponentiate.",
+      raw_predictors = predictors,
+      onehot_columns = train_cols,         # exact column order for the model matrix
+      transforms = list(
+        ambient = "amb_strava_<ring>m features are log1p(sum of network Strava in the annulus). Provided by the spatial join / precomputed grid; Node receives them already log1p-scaled.",
+        missing = "numeric NA -> 0",
+        categorical = "factor levels one-hot encoded as <var><level> matching onehot_columns"
+      )
+    )
+    write_json(spec_list, spec, auto_unbox = TRUE, pretty = TRUE)
+    c(txt, json, spec)
+  }
+
+  out <- c(write_one(bike_model, "bike"), write_one(ped_model, "ped"))
+  message("...Exported ", length(out), " Node model files to ", out_dir)
+  out
 }

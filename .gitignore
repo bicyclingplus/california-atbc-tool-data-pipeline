@@ -52,3 +52,6 @@ rsconnect/
 _targets/*
 !_tartgets/meta/
 _targets/.gitignore
+
+# scratch
+src/scratch/
