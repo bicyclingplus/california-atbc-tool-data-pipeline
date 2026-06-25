@@ -1,3 +1,8 @@
+# NOTE: This local _targets.yaml is NOT the one used at runtime.
+# The pipeline is run from the Box project root, which has its own _targets.yaml
+# pointing 'script' at this repo's _targets.R and 'store' at the Box cache.
+# See README.md ("Running the pipeline"). This file is kept only so the repo is
+# self-describing; editing it has no effect unless you run from this directory.
 main:
   script: src/_targets.R
   store: _targets
