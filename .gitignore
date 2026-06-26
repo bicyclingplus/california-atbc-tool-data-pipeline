@@ -56,5 +56,5 @@ _targets/.gitignore
 # scratch
 src/scratch/
 
-# web_tool 
+# web_tool scratch
 src/web_tool
