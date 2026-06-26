@@ -24,9 +24,13 @@ test_that("export_models_for_node writes model, json, and feature-spec per mode"
   expect_true(file.exists(file.path(out_dir, "bike_model.txt")))
   expect_true(file.exists(file.path(out_dir, "ped_feature_spec.json")))
 
-  # Feature spec records the exact one-hot column order and the no-exponentiate note.
+  # Feature spec records the exact one-hot column order, count-scale note, and
+  # the categorical level lists the Node feature-builder relies on.
   spec <- jsonlite::read_json(file.path(out_dir, "bike_feature_spec.json"))
   expect_equal(spec$objective, "tweedie")
   expect_true(length(spec$onehot_columns) >= 2)
-  expect_match(spec$note, "do NOT exponentiate", ignore.case = TRUE)
+  expect_match(spec$note, "count scale", ignore.case = TRUE)
+  # infra_type is categorical -> its levels are listed under `categorical`.
+  expect_true("infra_type" %in% names(spec$categorical))
+  expect_setequal(unlist(spec$categorical$infra_type), c("bike_lane", "quiet_street"))
 })

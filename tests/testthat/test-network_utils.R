@@ -47,14 +47,19 @@ test_that("map_volumes_across_network moves link bike vols to nodes (max) and no
   expect_equal(nrow(res$links), nrow(L))
 })
 
-test_that("finalize_web_network derives exposure classes and functional class", {
+test_that("finalize_web_network derives exposure classes and keeps the supplied functional", {
   links <- fixture_links()
   topo <- build_topology_from_links(links)
   L <- topo$links; N <- topo$nodes
-  L$infra_type <- c("primary", "secondary", "cycleway")
+  # functional (road hierarchy) and infra_type (bike facility) are SEPARATE axes,
+  # both supplied upstream. finalize_web_network must keep functional as-is, not
+  # re-derive it from infra_type.
+  L$functional <- c("Major Road", "Minor Road", "Local Road")
+  L$infra_type <- c("shared_arterial", "bike_lane", "separated_path")
   L$pred_bike_vol <- c(5, 50, 500)
   L$pred_ped_vol <- c(2, 20, 200)
-  N$infra_type <- "residential"
+  N$functional <- "Local Road"
+  N$infra_type <- "quiet_street"
   N$pred_bike_vol <- c(1, 10, 100, 5)[seq_len(nrow(N))]
   N$pred_ped_vol <- c(3, 30, 300, 9)[seq_len(nrow(N))]
 
@@ -62,8 +67,11 @@ test_that("finalize_web_network derives exposure classes and functional class", 
   expect_true(all(c("bicycle_exposure_class", "pedestrian_exposure_class",
                     "functional", "length_ft") %in% names(res$links)))
   expect_true(all(res$links$bicycle_exposure_class %in% c("Low", "Medium", "High")))
-  # primary road -> "Major Road"
+  # functional is carried through unchanged (NOT derived from infra_type).
   expect_equal(res$links$functional[res$links$edge_uid == "e1"], "Major Road")
+  expect_equal(res$links$functional[res$links$edge_uid == "e3"], "Local Road")
+  # infra_type stays the bike-facility value, distinct from functional.
+  expect_equal(res$links$infra_type[res$links$edge_uid == "e1"], "shared_arterial")
 })
 
 test_that("match_strava_to_osm joins osm attributes onto strava by osm_ref", {

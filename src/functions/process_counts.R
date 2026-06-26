@@ -1,7 +1,7 @@
 library(tidyverse)
 library(lubridate)
 
-#' Load UCB Bike Data (Gold Standard)
+#' Load UCB Bike Data (Miah et al. 2024b)
 load_ucb_bike <- function(file_path) {
   read_csv(file_path, show_col_types = FALSE) %>%
     mutate(
@@ -13,7 +13,7 @@ load_ucb_bike <- function(file_path) {
     select(spatial_id, lat = Lat, lon = Long, aadt, mode, source, year)
 }
 
-#' Load UCB Ped Data (Gold Standard)
+#' Load UCB Ped Data (Griswold et al. 2019)
 load_ucb_ped <- function(file_path) {
   read_csv(file_path, show_col_types = FALSE) %>%
     select(
@@ -32,8 +32,8 @@ load_ucb_ped <- function(file_path) {
     filter(!is.na(aadt), !is.na(lat), !is.na(lon))
 }
 
-#' Process & Expand Caltrans Counts (Internal Control Method)
-#' Uses the Caltrans data itself to derive expansion factors.
+#' Process & Expand Caltrans Counts (https://data.ca.gov/dataset/at-count-dataset)
+#' Internal Control Method: Uses the Caltrans data itself to derive expansion factors.
 process_caltrans_counts <- function(file_list, mode) {
   if (length(file_list) == 0) return(tibble())
   
@@ -41,7 +41,6 @@ process_caltrans_counts <- function(file_list, mode) {
   # reads the list of csvs, stacks into dataframe
   # data files are mode specific
   raw <- map_dfr(file_list, read_csv, show_col_types = FALSE) %>%
-    # RENAME UP FRONT to simplify grouping logic later
     rename(lat = latitude, lon = longitude) %>%
     mutate(
       date = ymd(str_sub(date, 1, 10)),
@@ -233,7 +232,7 @@ load_catportal_counts <- function(catdp_dir, ucb_sites = NULL, dedup_dist_m = 30
     filter(Mode %in% c(1, 2)) %>%
     mutate(mode = if_else(Mode == 1, "ped", "bike"))
 
-  # --- Read all selected files, keeping only the columns we need ----------
+  # --- Read all selected files, keeping only the needed columns ----------
   read_one <- function(fn, mode_label) {
     p <- file.path(catdp_dir, fn)
     if (!file.exists(p)) return(NULL)
@@ -262,13 +261,15 @@ load_catportal_counts <- function(catdp_dir, ucb_sites = NULL, dedup_dist_m = 30
   # volumes but with inverted direction labels. Those sites already enter the
   # pipeline via caltrans_*_clean (authoritative, full-year), so keeping the CAT
   # copy double-counts ~30 sites. Caltrans is kept; the CAT copies are dropped
-  # here at the row level. (%in% keeps NA-agency rows.) See
-  # docs/snapping_axis_assignment.md.
-  n0 <- nrow(raw)
-  raw <- raw %>% filter(!agency_name %in% "Caltrans")
-  message(sprintf("...CAT Portal: dropped %d Caltrans-agency rows (dup of caltrans_*_clean)",
-                  n0 - nrow(raw)))
-  if (nrow(raw) == 0) return(tibble())
+  # here at the row level. Best guess is CATDP has the ecocounter data, and Caltrans
+  # data blends ecocounter with computer vision data...need to ask Mintu and Julia.
+  if ("agency_name" %in% names(raw)) {
+    n0 <- nrow(raw)
+    raw <- raw %>% filter(!agency_name %in% "Caltrans")
+    message(sprintf("...CAT Portal: dropped %d Caltrans-agency rows (dup of caltrans_*_clean)",
+                    n0 - nrow(raw)))
+    if (nrow(raw) == 0) return(tibble())
+  }
 
   # Tag each row with its collection method (permanent vs human-observation).
   raw <- raw %>%
@@ -422,8 +423,8 @@ load_catportal_counts <- function(catdp_dir, ucb_sites = NULL, dedup_dist_m = 30
   # Two error sources: (a) within-day HOD-expansion noise (large for 2 h counts;
   # MAPE ~0.76 bike / 0.49 ped from the validation), shrinking as more of the day
   # is observed; (b) across-day sampling, shrinking with n_days. Combine into a
-  # relative SE (CV), then weight ~ 1/CV^2 (tempered: sqrt-compressed, mean-1,
-  # capped) so well-measured sites dominate without a handful swamping the fit.
+  # relative SE (CV), then weight ~ 1/CV^2 so well-measured sites dominate without 
+  # a handful dominating.
   hod_mape <- c(bike = 0.76, ped = 0.49)
   site_quality <- daily_vols %>%
     group_by(spatial_id, mode) %>%
@@ -437,7 +438,7 @@ load_catportal_counts <- function(catdp_dir, ucb_sites = NULL, dedup_dist_m = 30
       within_cv = hod_mape[mode] * (1 - pmin(mean_cov, 1)),
       # across-day error ~ 1/sqrt(n_days)
       across_cv = 1 / sqrt(pmax(n_days, 1)),
-      cv        = pmax(sqrt(within_cv^2 + across_cv^2), 0.04), # assumed minimum 4% error
+      cv        = pmax(sqrt(within_cv^2 + across_cv^2), 0.04), # assumed a floor 4% error
       weight_raw = 1 / cv^2
     )
 

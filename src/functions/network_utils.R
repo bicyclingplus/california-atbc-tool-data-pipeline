@@ -15,7 +15,7 @@ load_strava_network <- function(zip_files) {
   
   message("Processing ", length(zip_files), " Strava zip files in PARALLEL...")
   
-  # --- CHANGE: Use future_map instead of map ---
+  # --- Reading strava in parallel ---
   all_districts <- future_map(zip_files, function(zip_path) {
     
     # Need to explicitly load packages inside parallel workers
@@ -23,7 +23,7 @@ load_strava_network <- function(zip_files) {
     library(tidyverse)
     library(zip)
     
-    # A. Create a unique temp directory
+    # Create a unique temp directory
     # Use a random string to ensure no conflicts between parallel workers
     temp_dir <- file.path(tempdir(), paste0("str_", paste(sample(letters, 8), collapse="")))
     dir.create(temp_dir, showWarnings = FALSE)
@@ -31,7 +31,7 @@ load_strava_network <- function(zip_files) {
     # Extract ALL files
     unzip(zip_path, exdir = temp_dir)
     
-    # B. Identify and RENAME files
+    # Identify and RENAME files
     shp_raw <- list.files(temp_dir, pattern = "\\.shp$", full.names = TRUE)[1]
     
     if (is.na(shp_raw)) {
@@ -46,11 +46,11 @@ load_strava_network <- function(zip_files) {
       file.rename(f, file.path(temp_dir, paste0("edges.", ext)))
     })
     
-    # C. Read Geometry
+    # Read Geometry
     geo_path <- file.path(temp_dir, "edges.shp")
     geo <- st_read(geo_path, quiet = TRUE)
     
-    # Robust Column Selection
+    # Column name consistency
     orig_names <- names(geo)
     lower_names <- tolower(orig_names)
     
@@ -69,7 +69,7 @@ load_strava_network <- function(zip_files) {
     
     geo <- geo %>% st_transform(4326)
     
-    # D. Read CSV and Join
+    # Read CSV and Join
     csv_path <- file.path(temp_dir, "edges.csv")
     
     if (file.exists(csv_path)) {
@@ -112,7 +112,7 @@ load_strava_network <- function(zip_files) {
 }
 
 #' Download OSM Reference Data
-#' We download OSM just to get the attributes (Speed, Facility Type).
+#' We download OSM just to get the attributes (Speed, Facility Type, etc.).
 get_statewide_osm <- function() {
   library(osmextract)
   library(sf)
@@ -141,7 +141,7 @@ process_osm_tags <- function(osm_raw) {
     mutate(
       osm_id = as.character(osm_id),
       
-      # 1. INFRASTRUCTURE TYPE (Hierarchical: Best feature wins)
+      # INFRASTRUCTURE TYPE (Hierarchical: Best feature wins)
       infra_type = case_when(
         # High Comfort: Separated from cars
         highway %in% c("cycleway", "path", "footway", "pedestrian") | 
@@ -165,7 +165,7 @@ process_osm_tags <- function(osm_raw) {
         TRUE ~ "other"
       ),
       
-      # 2. SURFACE QUALITY (Binary: Is it rideable for a road bike?)
+      # SURFACE QUALITY (Binary: paved or not)
       # This handles your 160+ types by looking for "dirt-like" keywords
       is_paved = case_when(
         str_detect(surface, "asphalt|paved|concrete|paving_stones|sett|bricks|cement") ~ 1,
@@ -174,7 +174,7 @@ process_osm_tags <- function(osm_raw) {
         TRUE ~ 0
       ),
       
-      # 3. SPEED LIMIT (With functional fallbacks)
+      # SPEED LIMIT (With functional class fallbacks)
       speed_extracted = as.numeric(str_extract(maxspeed, "\\d+")),
       speed_limit = case_when(
         !is.na(speed_extracted) ~ speed_extracted,
@@ -185,10 +185,20 @@ process_osm_tags <- function(osm_raw) {
         highway %in% c("residential", "living_street", "service") ~ 25,
         infra_type == "separated_path" ~ 15,
         TRUE ~ 25
+      ),
+
+      # FUNCTIONAL CLASS (road hierarchy, from the raw OSM `highway` tag -- a
+      # DIFFERENT axis than infra_type, which describes bike facility. Major =
+      # high-speed arterials/highways; Minor = secondary/tertiary collectors;
+      # Local = residential / paths / everything else.)
+      functional = case_when(
+        highway %in% c("motorway", "trunk", "primary") ~ "Major Road",
+        highway %in% c("secondary", "tertiary")        ~ "Minor Road",
+        TRUE                                           ~ "Local Road"
       )
     ) %>%
-    # Rename variables to match your bike_features list
-    select(osm_id, infra_type, is_paved, speed_limit)
+    # Keep both axes: infra_type (bike facility) AND functional (road hierarchy).
+    select(osm_id, infra_type, is_paved, speed_limit, functional)
 }
 
 #' Match Strava with OSM Attributes
@@ -206,22 +216,20 @@ match_strava_to_osm <- function(strava_base, osm_processed) {
   # Deduplicate edge_uid. The per-district Strava clips overlap at Caltrans
   # district boundaries, so the same physical edge (identical geometry AND
   # strava volume) appears in two files -> duplicate edge_uid rows. Verified as
-  # true duplicates. Left undropped they (a) double-count Strava on boundary
-  # edges and (b) make the downstream centroid joins many-to-many, which blows
-  # up row counts (OOM) once spatial tiling concentrates them into seam tiles.
+  # true duplicates.
+  #
   # Keep the first occurrence per edge_uid; geometry/volume are identical so this
-  # is lossless. Guards against OSM-join multiplication too. Use base-R
-  # !duplicated() rather than dplyr::distinct(): distinct() on a ~7.8M-row sf
-  # drags the geometry list-column through its grouping machinery and is
-  # extremely slow; a single logical subset via sf's fast `[` is orders faster.
-  n_before <- nrow(result)
-  result   <- result[!duplicated(result$edge_uid), ]
-  if (n_before > nrow(result)) {
-    message(paste0("--- Dropped ", n_before - nrow(result),
-                   " duplicate edge_uid rows (boundary overlaps) ---"))
+  # is lossless. Guards against OSM-join multiplication too.
+  if ("edge_uid" %in% names(result)) {
+    n_before <- nrow(result)
+    result   <- result[!duplicated(result$edge_uid), ]
+    if (n_before > nrow(result)) {
+      message(paste0("--- Dropped ", n_before - nrow(result),
+                     " duplicate edge_uid rows (boundary overlaps) ---"))
+    }
   }
 
-  # The CORRECT diagnostic check
+  # diagnostic check
   total_rows <- nrow(result)
   matched_rows <- sum(!is.na(result$infra_type)) # Check infra_type, not highway!
   match_rate <- round((matched_rows / total_rows) * 100, 2)
@@ -232,7 +240,7 @@ match_strava_to_osm <- function(strava_base, osm_processed) {
 }
 
 #' Build Network Topology (from and to)
-#' Generates stable IDs for links and creates perfectly matching node geometries.
+#' Generates stable IDs for links and creates matching node geometries.
 #' Returns a list: list(links = sf_object, nodes = sf_object)
 build_topology_from_links <- function(links_sf) {
   library(sf)
@@ -254,9 +262,8 @@ build_topology_from_links <- function(links_sf) {
   end_idx   <- c(start_idx[-1] - 1L, n)
 
   # Coordinate key "x_y" rounded to 6 dp -- STRING key, stable across rebuilds
-  # (same coordinate always yields the same id). Only the ~2*n_lines endpoints
-  # are stringified, not every vertex, and via one sprintf() call rather than
-  # paste(round(),round()). Output is byte-identical to the old paste form.
+  # (same coordinate always yields the same id). Only the endpoints
+  # are stringified, not every vertex.
   hash_xy <- function(idx) {
     sprintf("%s_%s", as.character(round(coords[idx, 1], 6)),
                      as.character(round(coords[idx, 2], 6)))
@@ -269,8 +276,8 @@ build_topology_from_links <- function(links_sf) {
   node_ids_ordered <- c(rbind(links_sf$from, links_sf$to))
   endpoint_rows    <- c(rbind(start_idx, end_idx))   # coord rows, same interleave
 
-  # Deduplicate on node_id WITHOUT a 43.7M-row group_by/slice: take the coord
-  # rows at the line endpoints, keep the first occurrence of each node_id.
+  # Deduplicate on node_id: take the coord rows at the line endpoints, keep the 
+  # first occurrence of each node_id.
   keep <- !duplicated(node_ids_ordered)
   nodes_sf <- st_as_sf(
     data.frame(
@@ -332,17 +339,13 @@ map_volumes_across_network <- function(links, nodes) {
 finalize_web_network <- function(links, nodes) {
   require(dplyr)
   require(sf)
-  
-  # --- Helper 1: Functional Class Mapping ---
-  map_func <- function(type) {
-    case_when(
-      type %in% c("motorway", "trunk", "primary", "boulevard") ~ "Major Road",
-      type %in% c("secondary", "tertiary", "shared_arterial") ~ "Minor Road",
-      TRUE ~ "Local Road"
-    )
-  }
-  
-  # --- Helper 2: Exposure Class Calculation (Low/Medium/High) ---
+
+  # `functional` (road hierarchy: Major/Minor/Local Road) is carried through
+  # from OSM `highway` via process_osm_tags -- it is NOT derived from infra_type
+  # (bike facility). Links keep their own functional; nodes inherit the highest
+  # functional of their touching links (set in prep_network_topology).
+
+  # --- Helper: Exposure Class Calculation (Low/Medium/High) ---
   get_exposure_class <- function(vec) {
     # Default to Low if all values are 0 or NA
     if(all(vec == 0, na.rm = TRUE)) return(rep("Low", length(vec)))
@@ -359,17 +362,17 @@ finalize_web_network <- function(links, nodes) {
                                 labels = c("Low", "Medium", "High"), 
                                 include.lowest = TRUE))
     
-    # Catch any NAs that slipped through and default them to Low
+    # Catch any NAs and default them to Low
     classes[is.na(classes)] <- "Low"
     return(classes)
   }
   
   # --- Process Links ---
+  # `functional` is already present (carried from OSM); just compute length and
+  # the exposure classes.
   links_final <- links %>%
     mutate(
       length_ft = as.numeric(st_length(.)) * 3.28084,
-      functional = map_func(infra_type),
-      # Calculate the missing exposure classes!
       bicycle_exposure_class = get_exposure_class(pred_bike_vol),
       pedestrian_exposure_class = get_exposure_class(pred_ped_vol)
     ) %>%
@@ -380,10 +383,10 @@ finalize_web_network <- function(links, nodes) {
     )
   
   # --- Process Nodes ---
+  # `functional` is already present (highest class of touching links, set in
+  # prep_network_topology); just compute the exposure classes.
   nodes_final <- nodes %>%
     mutate(
-      functional = map_func(infra_type),
-      # Calculate the missing exposure classes!
       bicycle_exposure_class = get_exposure_class(pred_bike_vol),
       pedestrian_exposure_class = get_exposure_class(pred_ped_vol)
     ) %>%

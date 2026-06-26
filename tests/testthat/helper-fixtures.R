@@ -1,5 +1,5 @@
 # Shared setup for all tests: source the pipeline function files and provide tiny
-# synthetic fixtures. No Box data, no network, no pipeline.
+# synthetic fixtures.
 
 suppressMessages({
   library(sf); library(dplyr); library(terra); library(lightgbm)
@@ -17,7 +17,7 @@ for (f in list.files(.fn_dir, pattern = "\\.R$", full.names = TRUE)) {
 
 # --- Fixtures --------------------------------------------------------------
 
-# A tiny set of LINESTRING links in CRS 3310 (projected metres) with strava +
+# A tiny set of LINESTRING links in CRS 3310 (projected meters) with strava +
 # from/to node geometry already shared between adjacent links.
 fixture_links <- function() {
   l1 <- st_linestring(rbind(c(0, 0), c(100, 0)))      # A--B
