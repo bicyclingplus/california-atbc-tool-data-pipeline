@@ -41,43 +41,59 @@ PREDICTORS_A <- c("strava_vol_total", PREDICTORS_BASE)   # existing network
 PREDICTORS_B <- PREDICTORS_BASE                          # new off-street paths
 
 # LightGBM hyperparameters -- ALL behavior-affecting parameters listed explicitly
-# (no hidden defaults). Selected by grid search under spatial 5-fold CV with early
-# stopping, optimizing VOLUME-CLASS ACCURACY (low/mid/high). Tuned in three passes:
-# (1) tweedie_variance_power x num_leaves x min_data_in_leaf x feature_fraction;
-# (2) a finer sweep of tweedie_variance_power; (3) regularization
-# (lambda_l1/l2, bagging, max_depth). Regularization gains were small but
-# non-negative; bagging and depth limits never helped (best = no bagging,
-# unlimited depth). Optima differ by both mode and track. See src/model_tuning
+# (no hidden defaults). Selected in TWO stages of grid search under spatial 5-fold
+# CV with early stopping (src/model_tuning): stage 1 = tweedie_variance_power x
+# num_leaves x min_data_in_leaf x feature_fraction (tvp swept at 0.1 resolution);
+# stage 2 = regularization (lambda_l1/l2, bagging, max_depth) holding stage-1
+# winners fixed. Re-tuned 2026-06-26 WITH the `functional` predictor.
+#
+# Selection is NOT single-metric: priority order is (1) volume-class accuracy,
+# (2) low severe-misclassification (off-by-2, low<->high), (3) lower RMSE as the
+# tie-breaker, with the per-fold accuracy SE (~0.01) as the equivalence band.
+# Result: bike favors a heavy Tweedie power (1.9, best on all three); ped uses a
+# lower power (1.7, since higher powers buy only within-SE accuracy at worse off2
+# and RMSE) plus mild regularization incl. light row-subsampling that improves
+# ped calibration. See README_modeling.md "Hyperparameter selection".
 #
 #   target : "aadb" (bicycle) or "aadp" (pedestrian)
 #   track  : "A" (existing network, with on-link Strava) or "B" (Strava-free)
 lgb_params <- function(target, track = "A") {
-  bike <- identical(target, "aadb")
+  label <- paste0(track, "_", if (identical(target, "aadb")) "bike" else "ped")
 
   # --- per-(mode, track) tuned values ---------------------------------------
-  tvp   <- if (bike) 1.9 else 1.6                       # tweedie_variance_power
-  nleaf <- 95                                           # num_leaves (all models)
-  mdil  <- if (bike) 50 else 20                         # min_data_in_leaf
-  ff    <- if (bike) 0.7 else 1.0                       # feature_fraction
-  # regularization (per mode AND track):
-  reg <- if (bike && track == "A") list(l1 = 0.5, l2 = 0.0) else
-         if (bike && track == "B") list(l1 = 0.0, l2 = 2.0) else
-         if (!bike && track == "A") list(l1 = 0.0, l2 = 0.0) else
-                                    list(l1 = 0.5, l2 = 0.5)   # ped B
+  # tvp, num_leaves, min_data_in_leaf, feature_fraction, lambda_l1, lambda_l2,
+  # bagging_fraction. bagging_freq is derived (1 when bagging<1, else 0).
+  p <- switch(label,
+    A_bike = list(tvp = 1.9, nleaf = 63, mdil = 20, ff = 0.7, l1 = 0.0, l2 = 0.0, bag = 1.0),
+    B_bike = list(tvp = 1.9, nleaf = 95, mdil = 20, ff = 0.7, l1 = 2.0, l2 = 2.0, bag = 1.0),
+    A_ped  = list(tvp = 1.7, nleaf = 63, mdil = 50, ff = 0.7, l1 = 0.5, l2 = 0.0, bag = 0.8),
+    B_ped  = list(tvp = 1.7, nleaf = 31, mdil = 20, ff = 1.0, l1 = 2.0, l2 = 2.0, bag = 0.8),
+    stop("lgb_params: unknown target/track combination: ", label)
+  )
 
   list(
+    # --- estimation approach (LightGBM defaults, stated explicitly so the model
+    #     is reproducible against future default changes) ---------------------
+    boosting               = "gbdt", # gradient boosted decision trees (not dart/goss/rf)
+    # trees are grown LEAF-WISE (best-first); num_leaves -- not max_depth -- is the
+    # primary complexity control, which is why max_depth is left uncapped below.
+    max_bin                = 255L,   # histogram bins for split finding (default)
+    min_sum_hessian_in_leaf = 1e-3,  # default; min hessian (curvature) per leaf
+    min_data_in_bin        = 3L,     # default
+    # --- objective ------------------------------------------------------------
     objective              = "tweedie",
-    tweedie_variance_power = tvp,
+    tweedie_variance_power = p$tvp,
+    # --- tuned + complexity ---------------------------------------------------
     learning_rate          = 0.05,
-    num_leaves             = nleaf,
-    min_data_in_leaf       = mdil,
-    feature_fraction       = ff,     # column subsampling
-    bagging_fraction       = 1.0,    # row subsampling off (never improved CV)
-    bagging_freq           = 0,
-    max_depth              = -1,     # no depth limit (never improved CV)
+    num_leaves             = p$nleaf,
+    min_data_in_leaf       = p$mdil,
+    feature_fraction       = p$ff,                       # column subsampling
+    bagging_fraction       = p$bag,                      # row subsampling
+    bagging_freq           = if (p$bag < 1) 1L else 0L,  # bagging needs freq>0
+    max_depth              = -1,     # no depth limit; num_leaves governs (leaf-wise)
     min_gain_to_split      = 0.0,    # LightGBM default, stated explicitly
-    lambda_l1              = reg$l1,
-    lambda_l2              = reg$l2,
+    lambda_l1              = p$l1,
+    lambda_l2              = p$l2,
     verbosity              = -1
   )
 }

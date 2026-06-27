@@ -1,16 +1,19 @@
 # Shared setup for all tests: source the pipeline function files and provide tiny
-# synthetic fixtures.
+# synthetic data, no large files.
 
 suppressMessages({
   library(sf); library(dplyr); library(terra); library(lightgbm)
 })
 
-# Locate src/functions relative to the repo root (tests run from repo root).
-.fn_dir <- "src/functions"
-if (!dir.exists(.fn_dir)) {
-  # fall back to absolute repo path
-  .fn_dir <- "C:/Users/Dillon/projects/california-atbc-tool-data-pipeline/src/functions"
-}
+# Locate src/functions without hardcoding a machine path. testthat::test_path()
+# resolves relative to tests/testthat/ regardless of the working directory; the
+# bare relative path is a fallback for running the helper outside testthat (e.g.
+# from the repo root).
+.fn_dir <- tryCatch(
+  testthat::test_path("..", "..", "src", "functions"),
+  error = function(e) "src/functions"
+)
+if (!dir.exists(.fn_dir)) .fn_dir <- "src/functions"
 for (f in list.files(.fn_dir, pattern = "\\.R$", full.names = TRUE)) {
   suppressWarnings(suppressMessages(sys.source(f, envir = globalenv())))
 }

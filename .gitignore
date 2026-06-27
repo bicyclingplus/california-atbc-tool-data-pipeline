@@ -58,3 +58,5 @@ src/scratch/
 
 # web_tool scratch
 src/web_tool
+# Claude Code local (machine-specific) settings
+.claude/settings.local.json

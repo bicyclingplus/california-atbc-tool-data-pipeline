@@ -255,11 +255,14 @@ tryCatch({
     report_warn(paste("CRS not 3857:", st_crs(sample)$epsg))
   }
 
-  # Every predictor the web tool reads from the block (i.e. everything in the
-  # feature spec except the UI-supplied infra_type / is_paved / speed_limit)
-  # must exist as a column here, or the spatial join would be missing inputs.
+  # Every predictor the web tool reads from the block must exist as a column
+  # here, or the spatial join would be missing inputs. The per-feature
+  # predictors (infra_type, functional, is_paved, speed_limit) are supplied by
+  # the backend for the drawn link/node -- NOT joined from the block -- so they
+  # are excluded. functional is a road-hierarchy attribute of the feature, not
+  # of the census block.
   spec <- fromJSON(file.path(wm, "bike_feature_spec.json"))
-  ui_supplied <- c("infra_type", "is_paved", "speed_limit")
+  ui_supplied <- c("infra_type", "functional", "is_paved", "speed_limit")
   block_needed <- setdiff(spec$raw_predictors, ui_supplied)
   missing <- setdiff(block_needed, names(sample))
   if (length(missing) == 0) {
@@ -388,30 +391,21 @@ section("web_models/ (Track B bundle)")
 for (mode in c("bike", "ped")) {
   tryCatch({
     spec <- fromJSON(file.path(wm, paste0(mode, "_feature_spec.json")))
-    # lgb.load needs the path passed as the named `filename` argument; a
-    # positional path mis-binds and yields a non-Booster (the earlier
-    # "attempt to apply non-function" failure).
     model <- lightgbm::lgb.load(filename = file.path(wm, paste0(mode, "_model.txt")))
-    n_model_feat <- model$num_feature()
     n_spec_cols <- length(spec$onehot_columns)
-    cat("  ", mode, ": model features =", n_model_feat,
-        "| spec onehot_columns =", n_spec_cols, "\n")
 
-    # The model's feature count must match the spec the web tool builds against.
-    if (n_model_feat == n_spec_cols) {
-      report_pass(paste(mode, "feature count matches spec"))
-    } else {
-      report_fail(sprintf("%s feature mismatch: model=%d spec=%d",
-                          mode, n_model_feat, n_spec_cols))
-    }
-
-    # An all-zero input row should still yield a finite, non-negative count.
+    # The Booster has no public feature-count accessor in this lightgbm version,
+    # so we verify the contract directly: predicting on a 1-row matrix built to
+    # the spec's exact width (spec$onehot_columns) must succeed and return a
+    # finite, non-negative count. A width mismatch would error here, so a clean
+    # prediction proves the model and spec agree on the feature vector.
     input <- matrix(0, nrow = 1, ncol = n_spec_cols)
     colnames(input) <- spec$onehot_columns
     prediction <- predict(model, input)
-    cat("  ", mode, "dummy prediction (all-zero row):", round(prediction, 4), "\n")
+    cat("  ", mode, ": spec onehot_columns =", n_spec_cols,
+        "| dummy prediction (all-zero row) =", round(prediction, 4), "\n")
     if (is.finite(prediction) && prediction >= 0) {
-      report_pass(paste(mode, "predicts finite non-negative count"))
+      report_pass(paste(mode, "model accepts the spec-width vector and predicts a finite non-negative count"))
     } else {
       report_fail(paste(mode, "prediction invalid:", prediction))
     }
