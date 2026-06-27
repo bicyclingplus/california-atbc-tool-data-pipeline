@@ -324,13 +324,15 @@ list(
     format = "file"
   ),
   
-  # Prepare Web Context Blocks 
-  # Only keeping the geographic predictors. 
-  # Note: Year and Network vars are handled by the web UI, not the spatial join.
+  # Prepare Web Context Blocks
+  # Location-derived predictors (context + ambient Strava) for the web tool's
+  # spatial join. The UI supplies the per-feature predictors (infra_type,
+  # is_paved, speed_limit).
   tar_target(
     web_blocks_export_file,
     prepare_and_export_web_blocks(
       data = web_blocks_raw_chunks,
+      strava_grid = strava_grid,
       output_path = "data_processed/context_blocks.geojson"
     ),
     format = "file"
@@ -376,8 +378,8 @@ list(
     {
       path <- "data_processed/links.geojson"
       st_write(
-        final_web_network$links, 
-        path, 
+        st_transform(final_web_network$links, 4326),  # web data in lon/lat
+        path,
         driver = "GeoJSON",
         delete_dsn = TRUE,
         quiet = TRUE
@@ -393,9 +395,9 @@ list(
     {
       path <- "data_processed/nodes.geojson"
       st_write(
-        final_web_network$nodes, 
-        path, 
-        driver = "GeoJSON", 
+        st_transform(final_web_network$nodes, 4326),  # web data in lon/lat
+        path,
+        driver = "GeoJSON",
         delete_dsn = TRUE,
         quiet = TRUE
       )

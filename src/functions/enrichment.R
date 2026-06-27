@@ -19,9 +19,8 @@ process_switrs_data <- function(file_path) {
 #'   tmin -> annual mean of daily minimum temperature (deg C)
 #'   tmax -> annual mean of daily maximum temperature (deg C)
 #'
-#' Returned as a named character vector to call by variable. Used as a
-#' targets `format = "file"` target so the cached rasters are tracked.
-#' @param year       PRISM annual estime
+#' Returned as a named character vector to call by variable.
+#' @param year       PRISM annual estimate
 #' @param cache_dir  Folder for the PRISM download cache (created if needed).
 get_prism_climate <- function(year = 2023, cache_dir = "data_raw/prism",
                               resolution = "4km") {
@@ -48,10 +47,7 @@ get_prism_climate <- function(year = 2023, cache_dir = "data_raw/prism",
 #' the points to match.
 #' Returns a tibble (one row per input feature) with the three model columns.
 #' @param points_sf   sf POINT geometries (e.g. segment centroids).
-#' @param prism_paths Char vector from get_prism_climate(). NOTE: as a targets
-#'   `format = "file"` target it arrives UNNAMED, so we reassert the known return
-#'   order (ppt, tmin, tmax) rather than index by name (which would give NA ->
-#'   terra vsi path error).
+#' @param prism_paths Char vector from get_prism_climate().
 extract_prism <- function(points_sf, prism_paths) {
   if (is.null(names(prism_paths)) ||
       !all(c("ppt", "tmin", "tmax") %in% names(prism_paths))) {
@@ -86,7 +82,7 @@ enrich_base_network <- function(strava_sf, osm_sf, sld_sf, wi_sf, prism_paths) {
   osm_data <- osm_sf %>%
     st_drop_geometry() %>%
     mutate(osm_id = as.character(osm_id)) %>%
-    select(osm_id, any_of(c("infra_type", "is_paved", "speed_limit")))
+    select(osm_id, any_of(c("infra_type", "is_paved", "speed_limit", "functional")))
 
   strava_enriched <- strava_sf %>%
     mutate(osm_ref = as.character(osm_ref)) %>%
@@ -161,7 +157,7 @@ enrich_census <- function(strava_sf, census_sf) {
     # Select all census columns except those that might conflict (like geometry)
     select(edge_uid, everything()) %>%
     # One census block per link. A centroid landing on a block boundary can
-    # st_intersects two blocks -> duplicate edge_uid rows -> the final left_join
+    # intersect two blocks -> duplicate edge_uid rows -> the final left_join
     # below becomes one-to-many and duplicates the link. distinct() keeps the
     # first block (matches the "avoid double-counting" intent above).
     distinct(edge_uid, .keep_all = TRUE)
@@ -268,6 +264,7 @@ calculate_model_features <- function(strava_sf) {
     infra_type       = fast_coalesce(df_clean, "infra_type"),
     is_paved         = fast_coalesce(df_clean, "is_paved"),
     speed_limit      = fast_coalesce(df_clean, "speed_limit"),
+    functional       = fast_coalesce(df_clean, "functional"),  # road hierarchy
     
     # --- ENVIRONMENTAL/SAFETY (Prior Weather/Crash Joins) ---
     precip_annual    = fast_coalesce(df_clean, "prcp_annua"),
@@ -280,12 +277,13 @@ calculate_model_features <- function(strava_sf) {
       stra_leisure = fast_coalesce(df_clean, "strava_leisure"),
       recr_prop    = replace_na(stra_leisure / pmax(strava_vol_total, 1), 0),
       
-      # Mintu et al. Weekend-Weekday Index (WWI) Calculation
+      # Miah et al. (2025) Weekend-Weekday Index (WWI) Calculation
       WWI = 0.55134 - 0.04631 * log10(pmax(emp_density, 1)) + 0.61717 * (recr_prop^2),
       
-      # Convert infrastructure to factors for the Random Forest
+      # Convert categorical predictors to factors (one-hot at model time).
       infra_type = as.factor(infra_type),
-      is_paved   = as.factor(is_paved)
+      is_paved   = as.factor(is_paved),
+      functional = as.factor(replace_na(functional, "Local Road"))
     )
   
   # 5. REATTACH Geometry
@@ -313,18 +311,56 @@ prep_network_topology <- function(enriched_links) {
     mutate(
       across(matches("pharmacies|supermarket|schools|retail|parks|transit"), ~replace_na(as.numeric(.), 0)),
       infra_type = replace_na(as.character(infra_type), "other"),
-      is_paved = as.numeric(replace_na(is_paved, 1))
+      is_paved = as.numeric(replace_na(is_paved, 1)),
+      functional = replace_na(as.character(functional), "Local Road")
     )
 
   # Aggregate link attributes to nodes (for the ped model): pivot links to their
-  # endpoint node_ids, mean numeric / first character, join to node geometry.
+  # endpoint node_ids, then summarise per node. After pivot_longer each link
+  # contributes 2 rows (its two endpoints), so within a node group n() == the
+  # node degree (number of link-endpoints meeting there).
+  #
+  # Aggregation is per-attribute, not a blanket mean/first:
+  #   strava_vol_total : crossing volume without double-counting. Each link's
+  #                      volume is counted at BOTH its endpoints, so raw sum
+  #                      over-counts; sum / (0.5 * degree) == 2*sum/degree gives
+  #                      the through/crossing volume at the node.
+  #   speed_limit      : max  (intersection takes its fastest approaching road)
+  #   is_paved         : max  (paved if any leg is paved)
+  #   crash_count_30m  : sum  (all crashes near the meeting links)
+  #   functional       : highest road class touching the node (Major>Minor>Local)
+  #   infra_type       : most-protective facility touching the node
+  #   everything else (area/context: densities, BNA buffers, weather, ...) : mean
+  functional_rank <- c("Local Road" = 1, "Minor Road" = 2, "Major Road" = 3)
+  infra_rank <- c("other" = 1, "shared_arterial" = 2, "shared_lane_marked" = 3,
+                  "quiet_street" = 4, "bike_lane" = 5, "buffered_lane" = 6,
+                  "separated_path" = 7)
+  pick_max_rank <- function(x, ranks) {
+    x <- x[!is.na(x) & x %in% names(ranks)]
+    if (length(x) == 0) return(NA_character_)
+    names(which.max(ranks[x]))
+  }
+
   node_data <- links_final %>%
     st_drop_geometry() %>%
     pivot_longer(cols = c(from, to), values_to = "node_id") %>%
     group_by(node_id) %>%
     summarise(
-      across(where(is.numeric), ~mean(.x, na.rm = TRUE)),
-      across(where(is.character), ~first(.x)),
+      strava_vol_total = sum(strava_vol_total, na.rm = TRUE) / (0.5 * n()),
+      speed_limit      = max(speed_limit, na.rm = TRUE),
+      is_paved         = max(is_paved, na.rm = TRUE),
+      crash_count_30m  = sum(crash_count_30m, na.rm = TRUE),
+      across(
+        where(is.numeric) &
+          !any_of(c("strava_vol_total", "speed_limit", "is_paved", "crash_count_30m")),
+        ~mean(.x, na.rm = TRUE)
+      ),
+      functional = pick_max_rank(functional, functional_rank),
+      infra_type = pick_max_rank(infra_type, infra_rank),
+      across(
+        where(is.character) & !any_of(c("functional", "infra_type")),
+        ~first(.x)
+      ),
       .groups = "drop"
     )
   nodes_final <- inner_join(nodes_geom, node_data, by = "node_id")
@@ -334,9 +370,8 @@ prep_network_topology <- function(enriched_links) {
 
 # Fold a direction label to its road AXIS in [0,180): N/S->0, E/W->90,
 # NE/SW->45, NW/SE->135. Axis (not travel direction) is what we assign on, so
-# this is invariant to the travel-vs-approach label convention (and to the
-# CAT/Caltrans label inversion) -- E and W both fold to the E-W axis. Returns NA
-# for unparseable / missing direction (e.g. UCB bike -> undirected snap).
+# E and W both fold to the E-W axis. Returns NA for unparseable / 
+# missing direction (e.g. UCB bike -> undirected snap).
 direction_to_axis <- function(d) {
   d <- toupper(trimws(as.character(d)))
   brg <- dplyr::case_when(
@@ -352,24 +387,38 @@ direction_to_axis <- function(d) {
 axis_separation <- function(a, b) { d <- abs(a - b) %% 180; pmin(d, 180 - d) }
 
 # Assign each point to the nearest link whose AXIS aligns with the point's
-# count-axis (within `tol` deg, among links <= `dist` m). Fallbacks: if no
-# aligned link within `dist`, take the nearest link within `dist`; if no link at
-# all within `dist`, take the global nearest link. Returns a link row index per
-# point. Validated in scratch on 28 Caltrans + 817 CAT bike multi-leg sites
-# (see docs/snapping_axis_assignment.md).
+# count-axis (within `tol` 45deg default, among links <= `dist` 50m default).
+# If no aligned link within `dist`, take the nearest link within `dist`;
+# if no link at all within `dist`, take the global nearest link.
+# Returns a link row index per point.
+#
+# Fully VECTORIZED (no per-point loop). The earlier per-point version called
+# st_nearest_feature() inside the loop for every no-candidate point -- each a
+# full nearest search over the ~6M-link network -- and subset the 6M-row sf per
+# iteration, which ran for hours and accumulated memory to OOM. This does a fixed
+# handful of spatial ops over bare geometry instead:
+#   1) st_is_within_distance: candidate links per point (one call)
+#   2) st_nearest_feature:    global-nearest fallback for ALL points (one call)
+#   3) st_distance:           every (point, candidate) pair at once (one call)
+# then picks, per point, the nearest ALIGNED candidate (else nearest candidate)
+# via a vectorized order()/!duplicated() -- identical result to the loop, with
+# ties resolved to an equidistant link.
 snap_to_axis_link <- function(pts_sf, links_final, link_axis, count_axis,
                               dist = 50, tol = 45) {
-  cand <- sf::st_is_within_distance(pts_sf, links_final, dist)
-  chosen <- integer(nrow(pts_sf))
-  for (i in seq_len(nrow(pts_sf))) {
-    ci <- cand[[i]]
-    if (length(ci) == 0) {                                  # nothing within dist
-      chosen[i] <- sf::st_nearest_feature(pts_sf[i, ], links_final); next
-    }
-    aligned <- ci[axis_separation(link_axis[ci], count_axis[i]) <= tol]
-    pool <- if (length(aligned)) aligned else ci            # else nearest in-range link
-    di <- as.numeric(sf::st_distance(pts_sf[i, ], links_final[pool, ]))
-    chosen[i] <- pool[which.min(di)]
+  lg   <- sf::st_geometry(links_final)                 # bare sfc: cheap to index
+  cand <- sf::st_is_within_distance(pts_sf, lg, dist)  # candidate link idx per point
+  chosen <- sf::st_nearest_feature(pts_sf, lg)         # default = global nearest (no-candidate pts)
+
+  pii <- rep(seq_along(cand), lengths(cand))           # point index, one row per pair
+  lii <- unlist(cand)                                  # candidate link index
+  if (length(lii)) {
+    dpair <- as.numeric(sf::st_distance(pts_sf[pii, ], lg[lii], by_element = TRUE))
+    alg   <- axis_separation(link_axis[lii], count_axis[pii]) <= tol
+    # within each point: aligned candidates first, then by distance -> first row
+    # per point is the chosen link (nearest aligned, else nearest candidate).
+    ord <- order(pii, !alg, dpair)
+    sel <- ord[!duplicated(pii[ord])]
+    chosen[pii[sel]] <- lii[sel]
   }
   chosen
 }
@@ -398,7 +447,7 @@ snap_counts_to_network <- function(counts_df, network_list) {
   bike_raw$axis      <- direction_to_axis(bike_raw$direction)
 
   if(nrow(bike_raw) > 0) {
-    # 1. UNDIRECTED (no parseable direction, e.g. UCB) -> nearest link, as-is.
+    # UNDIRECTED (no parseable direction, e.g. UCB) -> nearest link, as-is.
     undirected <- bike_raw %>% filter(is.na(axis))
     if(nrow(undirected) > 0) {
       u_sf <- undirected %>%
@@ -410,7 +459,7 @@ snap_counts_to_network <- function(counts_df, network_list) {
         bind_cols(st_drop_geometry(u_sf) %>% select(aadb = raw_count, source, spatial_id, year))
     }
 
-    # 2. DIRECTIONAL -> sum legs per (site, year, axis), assign to nearest
+    # DIRECTIONAL -> sum legs per (site, year, axis), assign to nearest
     #    axis-aligned link. spatial_id = location (axis-independent) so both axes
     #    of one intersection stay in the same spatial-CV fold.
     directed <- bike_raw %>% filter(!is.na(axis))
@@ -447,6 +496,7 @@ snap_counts_to_network <- function(counts_df, network_list) {
 
   
   # --- SNAP PED COUNTS  ---
+  # all to nodes, much simpler than bike counts.
   ped_counts <- counts_df %>% 
     filter(mode == "ped", !is.na(aadt)) %>%
     rename(raw_count = aadt)
@@ -476,7 +526,7 @@ snap_counts_to_network <- function(counts_df, network_list) {
 # --- Prepare Census Blocks for Web Tool in chunks---
 enrich_census_chunk <- function(census_chunk, sld_sf, wi_sf, crash_sf, prism_paths) {
 
-  # 1. Setup & CRS Safety
+  # Setup & CRS Definition
   # Ensure the chunk is valid and ready
   blocks_proj <- census_chunk %>% st_make_valid()
   target_crs  <- st_crs(blocks_proj)
@@ -486,7 +536,7 @@ enrich_census_chunk <- function(census_chunk, sld_sf, wi_sf, crash_sf, prism_pat
   if (st_crs(sld_sf)     != target_crs) sld_sf     <- st_transform(sld_sf, target_crs)
   if (st_crs(wi_sf)      != target_crs) wi_sf      <- st_transform(wi_sf, target_crs)
   
-  # 2. Crash Aggregation (Optimized Fast Path)
+  # Crash Aggregation
   # Calculate area first
   blocks_proj <- blocks_proj %>% 
     mutate(
@@ -498,7 +548,7 @@ enrich_census_chunk <- function(census_chunk, sld_sf, wi_sf, crash_sf, prism_pat
   crash_hits <- st_intersects(blocks_proj, crash_sf)
   blocks_proj$crash_count <- lengths(crash_hits)
   
-  # 3. Environment (SLD/WI) - Centroid Sampling
+  # Environment (SLD/WI) - Centroid Sampling
   # Using centroids avoids "edge" issues where a block touches 2 zones
   block_centroids <- st_centroid(blocks_proj)
   
@@ -508,10 +558,10 @@ enrich_census_chunk <- function(census_chunk, sld_sf, wi_sf, crash_sf, prism_pat
     st_drop_geometry() %>%
     select(BLOCKID10, D1B, D3b, NatWalkInd)
   
-  # 4. Weather (PRISM 4km grid sampled at block centroids)
+  # Weather (PRISM 4km grid sampled at block centroids)
   clim <- extract_prism(block_centroids, prism_paths)
   
-  # 5. Merge & Format Columns
+  # Merge & Format Columns
   enriched_chunk <- blocks_proj %>%
     left_join(sld_wi_data, by = "BLOCKID10") %>%
     mutate(across(
@@ -564,7 +614,7 @@ prepare_web_blocks <- function(enriched_chunks, min_sqm_threshold = 1000) {
   
   message("...Finalizing Web Map & Fixing Slivers")
   
-  # 1. Ensure SF format and Re-Calculate Area
+  # Ensure SF format and Re-Calculate Area
   if (is.list(enriched_chunks) && !inherits(enriched_chunks, "sf")) {
     # Use do.call(rbind) to safely merge the list of SF objects
     full_blocks <- do.call(rbind, enriched_chunks) %>% st_as_sf()
@@ -575,7 +625,7 @@ prepare_web_blocks <- function(enriched_chunks, min_sqm_threshold = 1000) {
   full_blocks <- full_blocks %>% 
     mutate(area_sqm = as.numeric(st_area(.)))
   
-  # 2. Identify Slivers vs Keepers
+  # Identify Slivers vs Keepers
   slivers <- full_blocks %>% filter(area_sqm < min_sqm_threshold)
   keepers <- full_blocks %>% filter(area_sqm >= min_sqm_threshold)
   
@@ -598,7 +648,7 @@ prepare_web_blocks <- function(enriched_chunks, min_sqm_threshold = 1000) {
     # Copy attributes
     repaired_slivers[, cols_to_fix] <- source_data[, cols_to_fix]
     
-    # Instead of st_sf(), we manually assign the geometry to the original column name
+    # Instead of st_sf(), manually assign the geometry to the original column name
     repaired_slivers[[geo_col]] <- st_geometry(slivers)
     repaired_slivers <- st_as_sf(repaired_slivers) # Re-activate SF status
     

@@ -1,10 +1,16 @@
 # ============================================================================
-# tune_reg.R  --  Tune REGULARIZATION on class accuracy
+# tune_reg.R  --  Stage 2 of 2: regularization
 # ----------------------------------------------------------------------------
-# The earlier grids never varied regularization (lambda_l1/l2, bagging, max_depth);
-# these sat at LightGBM "off" defaults. Hold the already-tuned params at their
-# per-model winners and grid the regularization parameters, judged by volume-class
-# accuracy under spatial 5-fold CV with early stopping.
+# STAGE 2 of the two-stage hyperparameter selection (stage 1 = tune_final.R).
+# Holds the stage-1 winners fixed (see fixed_params() below) and grids the
+# regularization parameters (lambda_l1/l2, bagging, max_depth). Spatial 5-fold
+# CV + early stopping.
+#
+# Selection uses the same priority order as stage 1: (1) volume-class accuracy,
+# (2) low severe-misclassification (off-by-2), (3) lower RMSE as tie-breaker,
+# with the per-fold SE (~0.01) as the accuracy equivalence band. Regularization
+# is adopted only where it does not degrade calibration. See README_modeling.md
+# "Hyperparameter selection".
 #
 # Usage: Rscript tune_reg.R <A_bike|B_bike|A_ped|B_ped>
 # ============================================================================
@@ -17,18 +23,21 @@ source(file.path(LOCAL,"src/functions/modeling.R"))
 bike <- readRDS(file.path(LOCAL,"docs/bike_train_ambient.rds"))
 ped  <- readRDS(file.path(LOCAL,"docs/ped_train_ambient.rds"))
 AMB  <- c("amb_strava_250m","amb_strava_500m","amb_strava_1000m","amb_strava_2000m")
-# NOTE: these *_ambient.rds snapshots store RAW ambient sums, so we log1p here to
-# match extract_ambient(). When regenerating snapshots from the PRISM pipeline,
-# confirm whether the AMB cols are already log1p'd (extract_ambient does it) --
-# if so, DROP these two lines to avoid double-logging.
-bike <- bike %>% mutate(across(all_of(AMB), ~log1p(.)))
-ped  <- ped  %>% mutate(across(all_of(AMB), ~log1p(.)))
+# Snapshots are regenerated from the pipeline targets bike_train/ped_train, where
+# extract_ambient() has ALREADY applied log1p. Do NOT log1p again (double-log).
 PRED_A <- PREDICTORS_A; PRED_B <- PREDICTORS_B
 
-# Already-tuned, fixed per-model params (the non-regularization winners).
-fixed_params <- function(target){
-  if(identical(target,"aadb")) list(tweedie_variance_power=1.9, num_leaves=95, min_data_in_leaf=50, feature_fraction=0.7)
-  else                         list(tweedie_variance_power=1.6, num_leaves=95, min_data_in_leaf=20, feature_fraction=1.0)
+# Already-tuned, fixed per-(model, track) params: the non-regularization winners
+# from tune_final.R (re-tuned WITH the `functional` predictor, 2026-06-26). Keyed
+# by label so each track holds its own winner (they differ).
+fixed_params <- function(label){
+  switch(label,
+    A_bike = list(tweedie_variance_power=1.9, num_leaves=63, min_data_in_leaf=20, feature_fraction=0.7),
+    B_bike = list(tweedie_variance_power=1.9, num_leaves=95, min_data_in_leaf=20, feature_fraction=0.7),
+    A_ped  = list(tweedie_variance_power=1.7, num_leaves=63, min_data_in_leaf=50, feature_fraction=0.7),
+    B_ped  = list(tweedie_variance_power=1.7, num_leaves=31, min_data_in_leaf=20, feature_fraction=1.0),
+    stop("bad label: ", label)
+  )
 }
 
 score <- function(o,p){ok<-is.finite(o)&is.finite(p);o<-o[ok];p<-p[ok]
@@ -56,7 +65,7 @@ eval_cfg <- function(dat,fl,p){
 run <- function(df,preds,tg,label){
   dat<-prep(df,preds,tg); set.seed(123)
   fl<-map(group_vfold_cv(tibble(spatial_id=dat$sid),group=spatial_id,v=5)$splits, ~as.integer(complement(.x)))
-  fp <- fixed_params(tg)
+  fp <- fixed_params(label)
   grid<-expand.grid(lambda_l2=c(0,0.5,2,5), lambda_l1=c(0,0.5,2),
                     bagging_fraction=c(1.0,0.8,0.6), max_depth=c(-1,8))
   res<-map_dfr(seq_len(nrow(grid)), function(i){

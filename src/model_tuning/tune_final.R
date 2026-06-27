@@ -1,11 +1,19 @@
 # ============================================================================
-# tune_final.R  --  Clean retune on the CORRECT metric (class accuracy)
+# tune_final.R  --  Stage 1 of 2: tree-complexity + Tweedie power
 # ----------------------------------------------------------------------------
-# The earlier coarse grid optimized a percent-bias score we later discredited
-# (percent bias explodes near zero). This retunes ALL the params that matter --
-# tweedie_variance_power x num_leaves x min_data_in_leaf x feature_fraction --
-# judged by CLASS ACCURACY (low/mid/high), per model. Spatial 5-fold CV + early
-# stopping. Replaces the old tune_lightgbm.R / tune_tvp_fine.R results.
+# STAGE 1 of the two-stage hyperparameter selection (stage 2 = tune_reg.R for
+# regularization). Grids tweedie_variance_power x num_leaves x min_data_in_leaf
+# x feature_fraction together, with tweedie_variance_power swept at 0.1
+# resolution (1.6-1.9). Spatial 5-fold CV + early stopping.
+#
+# Selection is NOT single-metric: it follows a priority order of
+#   (1) volume-class accuracy (low/mid/high) -- the quantity the tool reports;
+#   (2) low severe-misclassification (off-by-2, low<->high) -- the most
+#       consequential planning error; then
+#   (3) lower RMSE (upper-tail magnitude calibration) as the tie-breaker.
+# The accuracy equivalence band is the per-fold SE (~0.01); configs inside it
+# are treated as tied on accuracy and separated by (2) then (3). See
+# README_modeling.md "Hyperparameter selection".
 #
 # Usage: Rscript tune_final.R <A_bike|B_bike|A_ped|B_ped>
 # ============================================================================
@@ -18,12 +26,9 @@ source(file.path(LOCAL,"src/functions/modeling.R"))
 bike <- readRDS(file.path(LOCAL,"docs/bike_train_ambient.rds"))
 ped  <- readRDS(file.path(LOCAL,"docs/ped_train_ambient.rds"))
 AMB  <- c("amb_strava_250m","amb_strava_500m","amb_strava_1000m","amb_strava_2000m")
-# NOTE: these *_ambient.rds snapshots store RAW ambient sums, so we log1p here to
-# match extract_ambient(). When regenerating snapshots from the PRISM pipeline,
-# confirm whether the AMB cols are already log1p'd (extract_ambient does it) --
-# if so, DROP these two lines to avoid double-logging.
-bike <- bike %>% mutate(across(all_of(AMB), ~log1p(.)))
-ped  <- ped  %>% mutate(across(all_of(AMB), ~log1p(.)))
+# Snapshots are now regenerated from the pipeline targets bike_train/ped_train,
+# where extract_ambient() has ALREADY applied log1p. Do NOT log1p again here
+# (that would double-log). (Older snapshots stored raw sums and logged here.)
 PRED_A <- PREDICTORS_A; PRED_B <- PREDICTORS_B
 
 # CLASS ACCURACY + supporting metrics

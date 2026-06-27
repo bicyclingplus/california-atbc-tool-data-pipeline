@@ -15,9 +15,7 @@ test_that("process_switrs_data drops missing coords and projects to 3310", {
 
 # --- PRISM climate extraction --------------------------------------------
 # extract_prism() samples ppt/tmin/tmax from the PRISM 4km grid at point
-# geometries. We avoid the network download (get_prism_climate) by writing tiny
-# synthetic single-cell-resolution rasters in PRISM's native CRS (EPSG:4269) and
-# checking the values land on the right cells.
+# geometries.
 
 # Build three synthetic PRISM-like rasters over a small CA-ish lon/lat window and
 # return their .bil paths, mimicking get_prism_climate()'s named output.

@@ -1,23 +1,26 @@
 # Shared setup for all tests: source the pipeline function files and provide tiny
-# synthetic fixtures. No Box data, no network, no pipeline.
+# synthetic data, no large files.
 
 suppressMessages({
   library(sf); library(dplyr); library(terra); library(lightgbm)
 })
 
-# Locate src/functions relative to the repo root (tests run from repo root).
-.fn_dir <- "src/functions"
-if (!dir.exists(.fn_dir)) {
-  # fall back to absolute repo path
-  .fn_dir <- "C:/Users/Dillon/projects/california-atbc-tool-data-pipeline/src/functions"
-}
+# Locate src/functions without hardcoding a machine path. testthat::test_path()
+# resolves relative to tests/testthat/ regardless of the working directory; the
+# bare relative path is a fallback for running the helper outside testthat (e.g.
+# from the repo root).
+.fn_dir <- tryCatch(
+  testthat::test_path("..", "..", "src", "functions"),
+  error = function(e) "src/functions"
+)
+if (!dir.exists(.fn_dir)) .fn_dir <- "src/functions"
 for (f in list.files(.fn_dir, pattern = "\\.R$", full.names = TRUE)) {
   suppressWarnings(suppressMessages(sys.source(f, envir = globalenv())))
 }
 
 # --- Fixtures --------------------------------------------------------------
 
-# A tiny set of LINESTRING links in CRS 3310 (projected metres) with strava +
+# A tiny set of LINESTRING links in CRS 3310 (projected meters) with strava +
 # from/to node geometry already shared between adjacent links.
 fixture_links <- function() {
   l1 <- st_linestring(rbind(c(0, 0), c(100, 0)))      # A--B
