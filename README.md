@@ -18,12 +18,12 @@ This git repository holds **only the code** (`src/`). The **data and the
 ```
 
 1. Cloud's `_targets.yaml` → `script:` points at this repo's `src/_targets.R`.
-2. Run `config.R` → `setwd()` and loads the function library.
+2. Update and Run `config.R` → `setwd()` and loads the function library.
 
 ## Running the pipeline
 
 Run with R 4.2.3 (the install with `targets` 1.11.4 + the model packages).
-Run `config.R` → `setwd()` and loads the function library.
+Update and Run `config.R` → `setwd()` and loads the function library.
 Run `_targets.R` target by target or `tar_make()` for full pipeline
 Approximately 6 hours on a Ryzen 7 1800X 8-core, 64GB RAM machine
 
