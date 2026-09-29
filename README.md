@@ -44,5 +44,4 @@ See standalone README_modeleing.md for details
 | `src/functions/process_counts.R` | UCB + Caltrans + CAT Portal count loaders; HOD + seasonality AADT expansion |
 | `src/functions/ambient.R` | Ambient Strava raster (`build_strava_grid` → `.tif`, `extract_ambient` lookup) |
 | `src/functions/modeling.R` | LightGBM Tweedie train / predict / spatial-CV validate; predictor sets; network prediction |
-| `src/functions/export.R` | Web-tool exports (Appendix A, context blocks, `export_models_for_node`) |
-| `src/convert_to_onnx.py` | One-time LightGBM → ONNX conversion for `onnxruntime-node` (run outside the pipeline) |
+| `src/functions/export.R` | Web-tool exports (Appendix A; context blocks with precomputed Track B new-path volumes) |

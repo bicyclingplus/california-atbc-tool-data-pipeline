@@ -18,7 +18,6 @@
 # =============================================================================
 
 dp <- "data_processed"
-wm <- file.path(dp, "web_models")
 
 # Each check records its result here; we print a tally at the end.
 results <- new.env()
@@ -248,28 +247,48 @@ tryCatch({
 
   sample <- ogr_head(path, layer, 20000)
 
-  # prepare_and_export_web_blocks() projects to Web Mercator (EPSG:3857).
-  if (isTRUE(st_crs(sample)$epsg == 3857)) {
-    report_pass("CRS = EPSG:3857 (Web Mercator)")
+  # Web data must be lon/lat (EPSG:4326) for the web map -- matches links/nodes
+  # and is required by the GeoJSON spec (RFC 7946).
+  if (isTRUE(st_crs(sample)$epsg == 4326)) {
+    report_pass("CRS = EPSG:4326")
   } else {
-    report_warn(paste("CRS not 3857:", st_crs(sample)$epsg))
+    report_fail(paste("CRS not 4326:", st_crs(sample)$epsg))
   }
 
-  # Every predictor the web tool reads from the block must exist as a column
-  # here, or the spatial join would be missing inputs. The per-feature
-  # predictors (infra_type, functional, is_paved, speed_limit) are supplied by
-  # the backend for the drawn link/node -- NOT joined from the block -- so they
-  # are excluded. functional is a road-hierarchy attribute of the feature, not
-  # of the census block.
-  spec <- fromJSON(file.path(wm, "bike_feature_spec.json"))
+  # Every location-derived predictor the block supplies to the Track B model
+  # must exist as a column here. The four facility predictors (infra_type,
+  # functional, is_paved, speed_limit) are held at fixed new-path constants
+  # inside prepare_and_export_web_blocks() -- not columns on the block -- so
+  # they are excluded. PREDICTORS_B (src/functions/modeling.R) is the source of
+  # truth for the model's inputs.
   ui_supplied <- c("infra_type", "functional", "is_paved", "speed_limit")
-  block_needed <- setdiff(spec$raw_predictors, ui_supplied)
+  block_needed <- setdiff(PREDICTORS_B, ui_supplied)
   missing <- setdiff(block_needed, names(sample))
   if (length(missing) == 0) {
     report_pass("all block-supplied model predictors present")
   } else {
     report_fail(paste("context_blocks MISSING predictors needed by web tool:",
                       paste(missing, collapse = ", ")))
+  }
+
+  # Precomputed Track B new-off-street-path volumes: the web tool reads these
+  # from the spatial join so they must be present, non-negative, finite, and not uniformly zero.
+  newpath_cols <- c("pred_bike_vol_newpath", "pred_ped_vol_newpath")
+  missing_pred <- setdiff(newpath_cols, names(sample))
+  if (length(missing_pred) > 0) {
+    report_fail(paste("context_blocks MISSING precomputed prediction columns:",
+                      paste(missing_pred, collapse = ", ")))
+  } else {
+    report_pass("precomputed new-path volume columns present")
+    for (col in newpath_cols) {
+      v <- as.numeric(sample[[col]])
+      cat("  ", col, "(sample):", num_summary(v), "\n")
+      if (all(is.finite(v)) && all(v >= 0) && any(v > 0)) {
+        report_pass(paste(col, "finite, non-negative, not all-zero"))
+      } else {
+        report_fail(paste(col, "bad (non-finite, negative, or all-zero)"))
+      }
+    }
   }
 
   ambient <- c("amb_strava_250m", "amb_strava_500m",
@@ -384,62 +403,6 @@ for (file in c("appendix_a_links.csv", "appendix_a_nodes.csv")) {
   }, error = function(e) report_fail(paste(file, "errored:", conditionMessage(e))))
 }
 
-
-# ===========================================================================
-section("web_models/ (Track B bundle)")
-
-for (mode in c("bike", "ped")) {
-  tryCatch({
-    spec <- fromJSON(file.path(wm, paste0(mode, "_feature_spec.json")))
-    model <- lightgbm::lgb.load(filename = file.path(wm, paste0(mode, "_model.txt")))
-    n_spec_cols <- length(spec$onehot_columns)
-
-    # The Booster has no public feature-count accessor in this lightgbm version,
-    # so we verify the contract directly: predicting on a 1-row matrix built to
-    # the spec's exact width (spec$onehot_columns) must succeed and return a
-    # finite, non-negative count. A width mismatch would error here, so a clean
-    # prediction proves the model and spec agree on the feature vector.
-    input <- matrix(0, nrow = 1, ncol = n_spec_cols)
-    colnames(input) <- spec$onehot_columns
-    prediction <- predict(model, input)
-    cat("  ", mode, ": spec onehot_columns =", n_spec_cols,
-        "| dummy prediction (all-zero row) =", round(prediction, 4), "\n")
-    if (is.finite(prediction) && prediction >= 0) {
-      report_pass(paste(mode, "model accepts the spec-width vector and predicts a finite non-negative count"))
-    } else {
-      report_fail(paste(mode, "prediction invalid:", prediction))
-    }
-
-    # The lgb.dump JSON the web tool may parse should be valid JSON.
-    invisible(fromJSON(file.path(wm, paste0(mode, "_model.json"))))
-    report_pass(paste0(mode, "_model.json parses"))
-  }, error = function(e) report_fail(paste(mode, "model errored:", conditionMessage(e))))
-}
-
-
-# ===========================================================================
-section("ONNX freshness")
-
-for (mode in c("bike", "ped")) {
-  onnx <- file.path(wm, paste0(mode, "_model.onnx"))
-  txt <- file.path(wm, paste0(mode, "_model.txt"))
-
-  if (file.exists(onnx) && file.exists(txt)) {
-    # The .onnx is produced outside the pipeline. If it predates the .txt it is
-    # stale and the Node tool would serve an old model.
-    hours_older <- as.numeric(difftime(file.mtime(txt), file.mtime(onnx), units = "hours"))
-    cat("  ", mode, ": onnx =", format(file.mtime(onnx)),
-        "| txt =", format(file.mtime(txt)), "\n")
-    if (hours_older > 1) {
-      report_warn(sprintf("%s .onnx older than .txt by %.1f h -> stale, re-run src/convert_to_onnx.py",
-                          mode, hours_older))
-    } else {
-      report_pass(paste(mode, ".onnx newer than/equal to .txt"))
-    }
-  } else {
-    report_warn(paste(mode, ".onnx missing -> run src/convert_to_onnx.py"))
-  }
-}
 
 
 # ===========================================================================
