@@ -69,7 +69,7 @@ test_that("load_catportal_counts HOD-expands a 2-hour count to a full day", {
                                ifelse(0:23 < 12, "AM", "PM")),
       interval_length = 60, volume = 10,
       latitude = 38.0, longitude = -121.0, bearing_dir = "North",
-      location_type = "Trail"
+      location_type = "Trail", agency_name = "P"
     )
   }))
   readr::write_csv(perm_rows, gzfile(file.path(dir, "perm.csv.gz")))
@@ -79,7 +79,7 @@ test_that("load_catportal_counts HOD-expands a 2-hour count to a full day", {
     interval_start = c("6/1/2023, 8:00:00 AM", "6/1/2023, 9:00:00 AM"),
     interval_length = 60, volume = 10,
     latitude = 39.0, longitude = -122.0, bearing_dir = "North",
-    location_type = "Trail"
+    location_type = "Trail", agency_name = "S"
   )
   readr::write_csv(short_rows, gzfile(file.path(dir, "short.csv.gz")))
 
@@ -102,7 +102,8 @@ test_that("load_catportal_counts de-duplicates sites near existing UCB sites", {
   readr::write_csv(meta, file.path(dir, "counts_zip_metadata.csv"))
   rows <- data.frame(
     interval_start = "6/1/2023, 8:00:00 AM", interval_length = 60, volume = 5,
-    latitude = 38.0, longitude = -121.0, bearing_dir = NA, location_type = "Mid-block")
+    latitude = 38.0, longitude = -121.0, bearing_dir = NA, location_type = "Mid-block",
+    agency_name = "S")
   readr::write_csv(rows, gzfile(file.path(dir, "s.csv.gz")))
 
   # A UCB site at the exact same coordinate -> the CAT site should be dropped.

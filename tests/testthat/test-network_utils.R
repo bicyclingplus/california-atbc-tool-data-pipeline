@@ -31,7 +31,7 @@ test_that("build_topology_from_links assigns shared endpoints the same node id",
   expect_equal(anyDuplicated(topo$nodes$node_id), 0)
 })
 
-test_that("map_volumes_across_network moves link bike vols to nodes (max) and node ped vols to links (avg)", {
+test_that("map_volumes_across_network moves link bike vols to nodes (sum/2) and node ped vols to links (avg)", {
   links <- fixture_links()
   topo <- build_topology_from_links(links)
   L <- topo$links; N <- topo$nodes
@@ -39,9 +39,13 @@ test_that("map_volumes_across_network moves link bike vols to nodes (max) and no
   N$pred_ped_vol <- seq_len(nrow(N)) * 100
 
   res <- map_volumes_across_network(L, N)
-  # each node's bike vol = max over incident links
+  # each node's bike vol = sum of incident link vols / 2 (bikes through the node)
   expect_true("pred_bike_vol" %in% names(res$nodes))
   expect_true(all(res$nodes$pred_bike_vol >= 0))
+  bv <- setNames(res$nodes$pred_bike_vol, res$nodes$node_id)
+  expect_equal(bv[["100_0"]], 15)    # B: (e1 10 + e2 20) / 2
+  expect_equal(bv[["200_0"]], 25)    # C: (e2 20 + e3 30) / 2
+  expect_equal(bv[["0_0"]], 5)       # A (dead end): e1 10 / 2
   # each link's ped vol = average of its two endpoint nodes' ped vols
   expect_true("pred_ped_vol" %in% names(res$links))
   expect_equal(nrow(res$links), nrow(L))
@@ -60,6 +64,7 @@ test_that("finalize_web_network derives exposure classes and keeps the supplied 
   L$pred_ped_vol <- c(2, 20, 200)
   N$functional <- "Local Road"
   N$infra_type <- "quiet_street"
+  N$degree <- c(1, 2, 2, 1)[seq_len(nrow(N))]   # chain A-B-C-D: ends 1, middle 2
   N$pred_bike_vol <- c(1, 10, 100, 5)[seq_len(nrow(N))]
   N$pred_ped_vol <- c(3, 30, 300, 9)[seq_len(nrow(N))]
 

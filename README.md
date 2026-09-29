@@ -31,6 +31,22 @@ Approximately 6 hours on a Ryzen 7 1800X 8-core, 64GB RAM machine
 
 Raw counts + Strava + context layers → enriched statewide network → ambient Strava demand field → LightGBM volume models → predicted bike/ped volumes → web-tool outputs.
 
+## Data vintages
+
+**Crash data (SWITRS via TIMS): 2019–2023** (`data_raw/switrs_2019_2023/`, extract
+2024-09-12), used for the Appendix A safety tables. A newer 2020–2025 extract
+(`data_raw/SWITRS_PEDBIKE_2020-2025_20260318/`) is on the drive but deliberately
+**not** used:
+
+- **Matches the exposure data.** Strava Metro volumes are 2023 and the count data
+  are mostly 2018–2023, so 2019–2023 crashes line up with the years the volume
+  estimates represent.
+- **Avoids provisional data.** The most recent SWITRS year is incomplete when
+  extracted: 2025 in the newer file is about 9% below 2024, and recent years grew
+  by about 3% between extracts as late reports arrived.
+
+Revisit when the exposure data (Strava, counts) move to later years.
+
 ## Modeling bike and pedestrian demand
 
 See standalone README_modeleing.md for details

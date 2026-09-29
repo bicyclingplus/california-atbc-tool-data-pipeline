@@ -295,7 +295,7 @@ calculate_model_features <- function(strava_sf) {
 # --- Builds the network topology over the full network (deployment="main"). ---
 # Generates stable from/to link ids + node geometry (coordinate-hashed, so ids
 # are reproducible across rebuilds), then aggregates link attributes to nodes
-# (mean of numeric, first of character) for the ped model.
+# for the ped model, plus node degree.
 prep_network_topology <- function(enriched_links) {
   message("...Building Network Topology (This is the slow part...)")
 
@@ -320,11 +320,13 @@ prep_network_topology <- function(enriched_links) {
   # contributes 2 rows (its two endpoints), so within a node group n() == the
   # node degree (number of link-endpoints meeting there).
   #
-  # Aggregation is per-attribute, not a blanket mean/first:
-  #   strava_vol_total : crossing volume without double-counting. Each link's
-  #                      volume is counted at BOTH its endpoints, so raw sum
-  #                      over-counts; sum / (0.5 * degree) == 2*sum/degree gives
-  #                      the through/crossing volume at the node.
+  # Aggregation is per-attribute:
+  #   strava_vol_total : crossing volume = sum / 2. Strava totals are
+  #                      bi-directional, and a through-trip uses two legs (in and
+  #                      out), so every trip appears twice in the summed leg
+  #                      volumes at ANY degree. (Each link is in a node's group
+  #                      once, so no per-degree correction.)
+  #   degree           : number of links meeting at the node (n())
   #   speed_limit      : max  (intersection takes its fastest approaching road)
   #   is_paved         : max  (paved if any leg is paved)
   #   crash_count_30m  : sum  (all crashes near the meeting links)
@@ -346,13 +348,14 @@ prep_network_topology <- function(enriched_links) {
     pivot_longer(cols = c(from, to), values_to = "node_id") %>%
     group_by(node_id) %>%
     summarise(
-      strava_vol_total = sum(strava_vol_total, na.rm = TRUE) / (0.5 * n()),
+      strava_vol_total = sum(strava_vol_total, na.rm = TRUE) / 2,
+      degree           = n(),
       speed_limit      = max(speed_limit, na.rm = TRUE),
       is_paved         = max(is_paved, na.rm = TRUE),
       crash_count_30m  = sum(crash_count_30m, na.rm = TRUE),
       across(
         where(is.numeric) &
-          !any_of(c("strava_vol_total", "speed_limit", "is_paved", "crash_count_30m")),
+          !any_of(c("strava_vol_total", "degree" ,"speed_limit", "is_paved", "crash_count_30m")),
         ~mean(.x, na.rm = TRUE)
       ),
       functional = pick_max_rank(functional, functional_rank),
