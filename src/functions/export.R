@@ -83,11 +83,12 @@ generate_localized_appendix_a <- function(links, nodes, processed_crash_proj,
   if (year_span == 0) year_span <- 5 # Fallback if missing
   
   # --- PREVENT DUPLICATES: Strict 1-to-1 Snapping ---
+  nodes_int   <- nodes %>% filter(degree >= 3)
   crashes_int <- processed_crash_proj %>% filter(INTERSECTION == "Y")
   crashes_seg <- processed_crash_proj %>% filter(INTERSECTION != "Y" | is.na(INTERSECTION))
   
-  node_idx <- st_nearest_feature(crashes_int, nodes)
-  crashes_int$node_id <- nodes$node_id[node_idx]
+  node_idx <- st_nearest_feature(crashes_int, nodes_int)
+  crashes_int$node_id <- nodes_int$node_id[node_idx]
   
   link_idx <- st_nearest_feature(crashes_seg, links)
   crashes_seg$edge_uid <- links$edge_uid[link_idx]
@@ -158,8 +159,8 @@ generate_localized_appendix_a <- function(links, nodes, processed_crash_proj,
     )
   
   appendix_a_nodes <- bind_rows(
-    calculate_alphas(nodes, crashes_int, "Bike", "Intersection", TRUE),
-    calculate_alphas(nodes, crashes_int, "Walk", "Intersection", TRUE)
+    calculate_alphas(nodes_int, crashes_int, "Bike", "Intersection", TRUE),
+    calculate_alphas(nodes_int, crashes_int, "Walk", "Intersection", TRUE)
   ) %>%
     select(
       `Location` = location, `Mode` = mode, `Exposure Class` = exposure_class,

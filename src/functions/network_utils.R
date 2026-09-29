@@ -299,7 +299,8 @@ map_volumes_across_network <- function(links, nodes) {
   require(tidyr)
   
   # Assign Link Bike Volume to Nodes ---
-  # Identify all links connected to a node and take the MAX volume
+  # Bikes through the node = sum of connecting link volumes / 2 (each
+  # through-trip uses two legs; link volumes are bi-directional).
   
   link_bike_to_node <- links %>%
     st_drop_geometry() %>%
@@ -307,7 +308,7 @@ map_volumes_across_network <- function(links, nodes) {
     # Pivot so we have a list of all node IDs and the volumes touching them
     pivot_longer(cols = c(from, to), values_to = "node_id") %>%
     group_by(node_id) %>%
-    summarise(pred_bike_vol = max(pred_bike_vol, na.rm = TRUE), .groups = "drop")
+    summarise(pred_bike_vol = sum(pred_bike_vol, na.rm = TRUE)/2, .groups = "drop")
   
   nodes_updated <- nodes %>%
     left_join(link_bike_to_node, by = "node_id") %>%
@@ -342,16 +343,16 @@ finalize_web_network <- function(links, nodes) {
 
   # `functional` (road hierarchy: Major/Minor/Local Road) is carried through
   # from OSM `highway` via process_osm_tags -- it is NOT derived from infra_type
-  # (bike facility). Links keep their own functional; nodes inherit the highest
-  # functional of their touching links (set in prep_network_topology).
+  # (bike facility). Links keep their own functional class; nodes inherit the highest
+  # functional class of the links they touch (set in prep_network_topology).
 
   # --- Helper: Exposure Class Calculation (Low/Medium/High) ---
-  get_exposure_class <- function(vec) {
+  get_exposure_class <- function(vec, ref = vec) {
     # Default to Low if all values are 0 or NA
     if(all(vec == 0, na.rm = TRUE)) return(rep("Low", length(vec)))
     
     # Calculate quantiles based only on non-zero volumes
-    vals <- vec[vec > 0 & !is.na(vec)]
+    vals <- ref[ref > 0 & !is.na(ref)]
     if(length(vals) < 3) return(rep("Low", length(vec)))
     
     breaks <- quantile(vals, probs = c(0, 0.33, 0.66, 1), na.rm = TRUE)
@@ -387,11 +388,12 @@ finalize_web_network <- function(links, nodes) {
   # prep_network_topology); just compute the exposure classes.
   nodes_final <- nodes %>%
     mutate(
-      bicycle_exposure_class = get_exposure_class(pred_bike_vol),
-      pedestrian_exposure_class = get_exposure_class(pred_ped_vol)
+      bicycle_exposure_class    = get_exposure_class(pred_bike_vol, pred_bike_vol[degree >= 3]),
+      pedestrian_exposure_class = get_exposure_class(pred_ped_vol,  pred_ped_vol[degree >= 3])
+
     ) %>%
     select(
-      node_id, pred_ped_vol, functional, infra_type, 
+      node_id, degree, pred_ped_vol, functional, infra_type, 
       pedestrian_exposure_class, pred_bike_vol, bicycle_exposure_class
     )
   

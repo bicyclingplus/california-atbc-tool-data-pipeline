@@ -103,7 +103,8 @@ test_that("functional is in the predictor sets and one-hot encodes", {
 # At shared node B both links meet (degree 2):
 #   functional       -> highest         = Major Road
 #   infra_type       -> most-protective = separated_path
-#   strava_vol_total -> 2*sum/degree    = 2*(10+30)/2 = 40
+#   strava_vol_total -> sum/2           = (10+30)/2 = 20
+#   degree           -> n()             = 2
 #   speed_limit      -> max             = 45
 #   is_paved         -> max             = 1
 #   crash_count_30m  -> sum             = 7
@@ -135,7 +136,8 @@ test_that("prep_network_topology aggregates link attributes to nodes correctly",
 
   expect_equal(b$functional, "Major Road")            # highest class
   expect_equal(b$infra_type, "separated_path")        # most-protective facility
-  expect_equal(b$strava_vol_total, 40)                # 2*sum/degree = 2*40/2
+  expect_equal(b$strava_vol_total, 20)                # sum/2 = 40/2 (crossing volume)
+  expect_equal(b$degree, 2)                           # two links meet at B
   expect_equal(b$speed_limit, 45)                     # max
   expect_equal(b$is_paved, 1)                         # max
   expect_equal(b$crash_count_30m, 7)                  # sum
