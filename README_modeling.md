@@ -41,7 +41,7 @@ Each location is characterized by network attributes (bicycle facility type, roa
 Volumes are modeled with gradient-boosted decision trees (LightGBM) under a Tweedie objective, which is appropriate for the heavily right-skewed, non-negative, continuous (annual averages) distribution of volume data. Two models are estimated per mode:
 
 - **Existing-network model (Track A).** Includes on-link Strava among its predictors. Its fitted volumes are written to the network output layers.
-- **New-facility model (Track B).** Excludes on-link Strava and relies on ambient activity and contextual covariates, enabling prediction for proposed off-street paths that have no prior activity record. This model is exported for on-demand prediction in the web tool.
+- **New-facility model (Track B).** Excludes on-link Strava and relies on ambient activity and contextual covariates, enabling prediction for proposed off-street paths that have no prior activity record. Its predictions for a new off-street path are precomputed per context block in the pipeline and included as columns on `context_blocks.geojson`, so the web tool reads a value from a user drawn path and nodes spatially joined to the context blocks.
 
 Bike models are at the bi-directional volume roadway (link) level, and pedestrian modes at total crossing volume intersection (node) level.
 
@@ -61,14 +61,8 @@ This rule produces an asymmetry between the modes. For the bicycle models a heav
 
 ## Network Prediction
 
-The models are applied within the pipeline and their predictions are written to GeoJSON network layers. The new-facility models (Track B) are exported as LightGBM text models together with a feature specification and converted to ONNX for execution in the Node.js web application via `onnxruntime-node`.
+The models are applied within the pipeline and their predictions are written to GeoJSON network layers. The new-facility models (Track B) are also applied within the pipeline: for a new off-street path the four facility predictors (`infra_type`, `functional`, `is_paved`, `speed_limit`) are held at fixed constants — they carry only a few percent of model gain — so each block's prediction is effectively a function of location. Those predictions are precomputed per context block and written as `pred_bike_vol_newpath` / `pred_ped_vol_newpath` columns on `context_blocks.geojson` (see `prepare_and_export_web_blocks()` in `src/functions/export.R`). The web tool spatially joins a drawn feature to a block and reads the value.
 
-ONNX conversion is a **one-time step outside the pipeline** in python:
-
-```
-pip install lightgbm onnxmltools skl2onnx onnx
-python src/convert_to_onnx.py --models-dir ".../data_processed/web_models"
-```
 ---
 
 ## References

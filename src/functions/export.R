@@ -1,5 +1,10 @@
 # Export blocks for spatial join on web tool
-prepare_and_export_web_blocks <- function(data, strava_grid, output_path) {
+#
+# Also computes the Track B (link-level Strava-free) new-off-street-path volumes per
+# block so the web tool reads. This includes the simplifying assumption that the four
+# facility predictors (infra_type, functional, is_paved, speed_limit) are constant --
+# so a block's off-street path prediction is a function of location alone.
+prepare_and_export_web_blocks <- function(data, strava_grid, bike_model, ped_model, output_path) {
   require(sf)
   require(dplyr)
 
@@ -14,13 +19,26 @@ prepare_and_export_web_blocks <- function(data, strava_grid, output_path) {
   # every location-derived predictor in one lookup. Already log1p-scaled.
   data <- bind_cols(data, extract_ambient(strava_grid, data))
 
+  # --- Precompute Track B new-path volumes ----------------------------------
+  # Fix the four facility predictors to the new-off-street-path constants
+  facility_fixed <- mutate(
+    data,
+    infra_type  = "separated_path",
+    functional  = "Local Road",
+    is_paved    = 1,
+    speed_limit = 15
+  )
+  data$pred_bike_vol_newpath <- predict_lgb(bike_model, facility_fixed)
+  data$pred_ped_vol_newpath  <- predict_lgb(ped_model,  facility_fixed)
+
   # Spatial Cleaning & Projection
   web_blocks <- data %>%
     st_make_valid() %>%
-    st_transform(3857) %>% # Web Mercator 
-    # Select the location-derived model predictors (context + ambient). The UI
-    #    supplies the remaining per-feature predictors: infra_type, is_paved,
-    #    speed_limit.
+    st_transform(4326) %>% # lon/lat (EPSG:4326) -- matches links/nodes and RFC 7946
+    # Select the location-derived model predictors (context + ambient) plus the
+    # precomputed new-path volumes. The web tool spatially joins a drawn feature
+    # to a block and reads pred_bike_vol_newpath (a drawn path/link) and/or
+    # pred_ped_vol_newpath (its intersections) -- no live model needed.
     select(
       any_of(c(
         "emp_density", "int_density", "walk_index", "housing_total",
@@ -31,10 +49,11 @@ prepare_and_export_web_blocks <- function(data, strava_grid, output_path) {
         "parks_low", "parks_high", "trails_low", "trails_high",
         "community_low", "community_high", "transit_low", "transit_high",
         "precip_annual", "temp_min", "temp_max",
-        "amb_strava_250m", "amb_strava_500m", "amb_strava_1000m", "amb_strava_2000m"
+        "amb_strava_250m", "amb_strava_500m", "amb_strava_1000m", "amb_strava_2000m",
+        "pred_bike_vol_newpath", "pred_ped_vol_newpath"
       ))
     )
-  
+
   # Export 
   if(!dir.exists(dirname(output_path))) dir.create(dirname(output_path), recursive = TRUE)
   
@@ -157,67 +176,4 @@ generate_localized_appendix_a <- function(links, nodes, processed_crash_proj,
   write_csv(appendix_a_nodes, output_path_nodes)
   
   return(c(output_path_links, output_path_nodes))
-}
-
-#' Export Track B (Strava-free) models for the Node.js web tool.
-#' Writes, per mode, the LightGBM artifacts plus a JSON feature-spec so
-#' Node can build the input vector identically. ONNX conversion (for
-#' onnxruntime-node) is a separate one-time step: scripts/convert_to_onnx.py.
-#'
-#' Outputs (returned as a character vector for a format="file" target):
-#'   <out_dir>/<mode>_model.txt      LightGBM text model (lgb.save)
-#'   <out_dir>/<mode>_model.json     lgb.dump (tree structure, JS-parseable)
-#'   <out_dir>/<mode>_feature_spec.json  predictors, one-hot column order, transforms
-export_models_for_node <- function(bike_model, ped_model, out_dir) {
-  require(lightgbm); require(jsonlite)
-  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
-
-  write_one <- function(model, mode) {
-    txt  <- file.path(out_dir, paste0(mode, "_model.txt"))
-    json <- file.path(out_dir, paste0(mode, "_model.json"))
-    spec <- file.path(out_dir, paste0(mode, "_feature_spec.json"))
-
-    # model is a stored lgb_model (text + metadata). Reconstitute the booster.
-    booster <- lgb_booster(model)
-    lightgbm::lgb.save(booster, txt)
-    writeLines(lightgbm::lgb.dump(booster), json)
-
-    # Feature contract: the exact one-hot column order the model expects, the
-    # raw predictors, which are categorical, and the transforms Node must apply.
-    train_cols <- model$train_cols
-    predictors <- model$predictors
-
-    # Categorical predictors + their one-hot levels, derived from the column
-    # schema: a predictor that is NOT itself a column was factor-expanded into
-    # <predictor><level> columns. Listing them explicitly lets Node build the
-    # one-hot vector deterministically (no prefix guessing).
-    cat_levels <- list()
-    for (p in predictors) {
-      if (!(p %in% train_cols)) {
-        hits <- train_cols[startsWith(train_cols, p)]
-        cat_levels[[p]] <- substring(hits, nchar(p) + 1L)
-      }
-    }
-
-    spec_list <- list(
-      mode = mode,
-      target = model$target,
-      objective = "tweedie",
-      note = "LightGBM Tweedie returns predictions on the COUNT scale (already exponentiated).",
-      raw_predictors = predictors,
-      categorical = cat_levels,            # {predictor: [levels]} for one-hot
-      onehot_columns = train_cols,         # exact column order for the model matrix
-      transforms = list(
-        ambient = "amb_strava_<ring>m features are log1p(sum of network Strava in the ring). Provided by the spatial join / precomputed grid; Node receives them already log1p-scaled.",
-        missing = "numeric NA -> 0",
-        categorical = "factor levels one-hot encoded as <var><level> matching onehot_columns; see `categorical` for the level lists"
-      )
-    )
-    write_json(spec_list, spec, auto_unbox = TRUE, pretty = TRUE)
-    c(txt, json, spec)
-  }
-
-  out <- c(write_one(bike_model, "bike"), write_one(ped_model, "ped"))
-  message("...Exported ", length(out), " Node model files to ", out_dir)
-  out
 }

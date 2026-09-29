@@ -311,28 +311,18 @@ list(
   # SECTION 8: WEBTOOL OUTPUTS
   # ============================================================================
 
-  # Export Track B models for the Node.js web tool (new-path prediction).
-  # LightGBM -> text and JSON and a JSON feature-spec. post-pipeline
-  # python stripc (convert_to_onnx.py) needed to convert to ONNX (onnxruntime-node)
-  tar_target(
-    web_model_assets_file,
-    export_models_for_node(
-      bike_model = model_bike_B,
-      ped_model  = model_ped_B,
-      out_dir    = "data_processed/web_models"
-    ),
-    format = "file"
-  ),
-  
   # Prepare Web Context Blocks
   # Location-derived predictors (context + ambient Strava) for the web tool's
-  # spatial join. The UI supplies the per-feature predictors (infra_type,
-  # is_paved, speed_limit).
+  # spatial join, and the precomputed Track B new-off-street-path volumes
+  # (pred_bike_vol_newpath / pred_ped_vol_newpath). The web tool reads those
+  # columns from its spatial join.
   tar_target(
     web_blocks_export_file,
     prepare_and_export_web_blocks(
       data = web_blocks_raw_chunks,
       strava_grid = strava_grid,
+      bike_model = model_bike_B,
+      ped_model  = model_ped_B,
       output_path = "data_processed/context_blocks.geojson"
     ),
     format = "file"
