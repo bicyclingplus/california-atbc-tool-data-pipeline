@@ -5,8 +5,8 @@ test_that("lgb_params returns mode-specific tuned values", {
   pp <- lgb_params("aadp")               # pedestrian
   expect_equal(pb$tweedie_variance_power, 1.9)
   expect_equal(pb$feature_fraction, 0.7)
-  expect_equal(pp$tweedie_variance_power, 1.6)
-  expect_equal(pp$feature_fraction, 1.0)
+  expect_equal(pp$tweedie_variance_power, 1.7)
+  expect_equal(pp$feature_fraction, 0.7)
   expect_equal(pb$objective, "tweedie")
 })
 
@@ -20,11 +20,11 @@ test_that("lgb_params lists ALL behavior-affecting params explicitly", {
 })
 
 test_that("lgb_params applies per-track regularization", {
-  expect_equal(lgb_params("aadb", "A")$lambda_l1, 0.5)
+  expect_equal(lgb_params("aadb", "A")$lambda_l1, 0.0)
   expect_equal(lgb_params("aadb", "A")$lambda_l2, 0.0)
   expect_equal(lgb_params("aadb", "B")$lambda_l2, 2.0)
-  expect_equal(lgb_params("aadp", "A")$lambda_l2, 0.0)   # ped A: no reg
-  expect_equal(lgb_params("aadp", "B")$lambda_l1, 0.5)
+  expect_equal(lgb_params("aadp", "A")$lambda_l2, 0.0)   # ped A: l1 only
+  expect_equal(lgb_params("aadp", "B")$lambda_l1, 2.0)
 })
 
 test_that("train_lgb infers track from presence of on-link Strava", {
